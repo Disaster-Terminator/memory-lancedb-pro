@@ -2,7 +2,7 @@
   "id": "memory-lancedb-pro",
   "name": "Memory (LanceDB Pro)",
   "description": "Enhanced LanceDB-backed long-term memory with hybrid retrieval, multi-scope isolation, long-context chunking, and management CLI",
-  "version": "1.0.21",
+  "version": "1.0.26",
   "kind": "memory",
   "configSchema": {
     "type": "object",
@@ -17,7 +17,21 @@
             "const": "openai-compatible"
           },
           "apiKey": {
-            "type": "string"
+            "oneOf": [
+              {
+                "type": "string",
+                "minLength": 1
+              },
+              {
+                "type": "array",
+                "items": {
+                  "type": "string",
+                  "minLength": 1
+                },
+                "minItems": 1
+              }
+            ],
+            "description": "Single API key or array of keys for round-robin rotation"
           },
           "model": {
             "type": "string"
@@ -72,6 +86,13 @@
         "maximum": 200,
         "default": 15,
         "description": "Minimum prompt length (in characters) to trigger auto-recall. Prompts shorter than this are skipped. Default: 15 for English, 6 for CJK."
+      },
+      "autoRecallMinRepeated": {
+        "type": "integer",
+        "minimum": 0,
+        "maximum": 100,
+        "default": 0,
+        "description": "Minimum number of turns before the same memory can be recalled again in the same session. Set to 0 to disable deduplication (default behavior: inject all memories)."
       },
       "captureAssistant": {
         "type": "boolean"
@@ -185,6 +206,20 @@
             "maximum": 365,
             "default": 60,
             "description": "Time decay half-life in days. Old entries lose score gradually. Floor at 0.5x. Set 0 to disable."
+          },
+          "reinforcementFactor": {
+            "type": "number",
+            "minimum": 0,
+            "maximum": 2,
+            "default": 0.5,
+            "description": "Access reinforcement factor for time decay. Frequently recalled memories decay slower. 0 to disable."
+          },
+          "maxHalfLifeMultiplier": {
+            "type": "number",
+            "minimum": 1,
+            "maximum": 10,
+            "default": 3,
+            "description": "Maximum half-life multiplier from access reinforcement. Prevents frequently accessed memories from becoming immortal."
           }
         }
       },
@@ -243,10 +278,10 @@
   },
   "uiHints": {
     "embedding.apiKey": {
-      "label": "API Key",
+      "label": "API Key(s)",
       "sensitive": true,
-      "placeholder": "sk-proj-... or ${GEMINI_API_KEY} or 'ollama'",
-      "help": "API key for the embedding provider (or use ${OPENAI_API_KEY}; use a dummy value for keyless local endpoints)"
+      "placeholder": "sk-proj-... or [\"key1\", \"key2\"] for rotation",
+      "help": "Single API key or array of keys for round-robin rotation with automatic failover on rate limits (or use ${OPENAI_API_KEY}; use a dummy value for keyless local endpoints)"
     },
     "embedding.model": {
       "label": "Embedding Model",
@@ -304,6 +339,11 @@
     "autoRecallMinLength": {
       "label": "Auto-Recall Min Length",
       "help": "Minimum prompt length to trigger auto-recall (shorter prompts are skipped). Default: 15 chars for English, 6 for CJK.",
+      "advanced": true
+    },
+    "autoRecallMinRepeated": {
+      "label": "Auto-Recall Min Repeated",
+      "help": "Minimum number of conversation turns before a specific memory can be re-injected in the same session.",
       "advanced": true
     },
     "captureAssistant": {
