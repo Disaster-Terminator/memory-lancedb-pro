@@ -80,7 +80,7 @@ The built-in `memory-lancedb` plugin in OpenClaw provides basic vector search. *
 
 | File | Purpose |
 |------|---------|
-| `index.ts` | Plugin entry point. Registers with OpenClaw Plugin API, parses config, mounts `before_agent_start` (auto-recall), `agent_end` (auto-capture), and `command:new` (session memory) hooks |
+| `index.ts` | Plugin entry point. Registers with OpenClaw Plugin API, parses config, mounts `before_agent_start` (auto-recall), `agent_end` (auto-capture), integrated `self-improvement` (`agent:bootstrap`, `command:new/reset`) and integrated `memory-reflection` (`command:new/reset`) hooks |
 | `openclaw.plugin.json` | Plugin metadata + full JSON Schema config declaration (with `uiHints`) |
 | `package.json` | NPM package info. Depends on `@lancedb/lancedb`, `openai`, `@sinclair/typebox` |
 | `cli.ts` | CLI commands: `memory list/search/stats/delete/delete-bulk/export/import/reembed/migrate` |
@@ -88,7 +88,7 @@ The built-in `memory-lancedb` plugin in OpenClaw provides basic vector search. *
 | `src/embedder.ts` | Embedding abstraction. Compatible with any OpenAI-API provider (OpenAI, Gemini, Jina, Ollama, etc.). Supports task-aware embedding (`taskQuery`/`taskPassage`) |
 | `src/retriever.ts` | Hybrid retrieval engine. Vector + BM25 → RRF fusion → Jina Cross-Encoder Rerank → Recency Boost → Importance Weight → Length Norm → Time Decay → Hard Min Score → Noise Filter → MMR Diversity |
 | `src/scopes.ts` | Multi-scope access control. Supports `global`, `agent:<id>`, `custom:<name>`, `project:<id>`, `user:<id>` |
-| `src/tools.ts` | Agent tool definitions: `memory_recall`, `memory_store`, `memory_forget` (core) + `memory_stats`, `memory_list` (management) |
+| `src/tools.ts` | Agent tool definitions: `memory_recall`, `memory_store`, `memory_forget` (core), `self_improvement_log` (default), and governance tools `self_improvement_review` / `self_improvement_extract_skill` (management mode) |
 | `src/noise-filter.ts` | Noise filter. Filters out agent refusals, meta-questions, greetings, and low-quality content |
 | `src/adaptive-retrieval.ts` | Adaptive retrieval. Determines whether a query needs memory retrieval (skips greetings, slash commands, simple confirmations, emoji) |
 | `src/migrate.ts` | Migration tool. Migrates data from the built-in `memory-lancedb` plugin to Pro |
@@ -146,13 +146,86 @@ Filters out low-quality content at both auto-capture and tool-store stages:
 - Meta-questions ("do you remember")
 - Greetings ("hi", "hello", "HEARTBEAT")
 
-### 7. Session Memory
+### 7. Session Strategy
 
-- Triggered on `/new` command — saves previous session summary to LanceDB
-- Disabled by default (OpenClaw already has native `.jsonl` session persistence)
-- Configurable message count (default: 15)
+- `sessionStrategy: "systemSessionMemory"` (default): disable plugin reflection hooks; use OpenClaw built-in `session-memory`
+- `sessionStrategy: "memoryReflection"`: use plugin reflection hooks (explicit opt-in)
+- `sessionStrategy: "none"`: disable plugin session strategy hooks
+- Compatibility: legacy `sessionMemory.enabled=true|false` maps to `systemSessionMemory|none`
+- Upgrade behavior note:
+  - Previous plugin-driven session-summary behavior is no longer the implicit default.
+  - After upgrading, deployments that want plugin reflection on `/new` / `/reset` must explicitly set `sessionStrategy: "memoryReflection"`.
+  - Keeping legacy `sessionMemory.enabled: true` now preserves safer compatibility through `systemSessionMemory`, instead of silently enabling the newer reflection pipeline.
 
-### 8. Auto-Capture & Auto-Recall
+### 8. Self-Improvement
+
+- Hooks: `agent:bootstrap`, `command:new`, `command:reset`
+- `agent:bootstrap`: injects `SELF_IMPROVEMENT_REMINDER.md` into bootstrap context
+- `command:new` / `command:reset`: appends a short `/note self-improvement ...` reminder before reset
+- Files: ensures `.learnings/LEARNINGS.md`, `.learnings/ERRORS.md`, `.learnings/FEATURE_REQUESTS.md`
+- Behavior note:
+  - This flow is integrated into the plugin lifecycle and can coexist with `sessionStrategy=systemSessionMemory`.
+  - It is separate from `memoryReflection`: seeing self-improvement notes or `.learnings/*` activity does not by itself mean reflection storage is enabled.
+  - Governance-oriented extraction/review actions remain explicitly tool-driven rather than background-triggered.
+- Tools:
+  - `self_improvement_log`: write structured LRN/ERR/FEAT entries
+  - `self_improvement_review`: summarize governance backlog (pending/high/promoted)
+  - `self_improvement_extract_skill`: extract a reusable `SKILL.md` scaffold from a learning entry
+    - Trigger: explicit tool call by user/model (not background auto-trigger)
+    - Timing: on-demand, one-shot execution
+    - Inputs: explicit `learningId` and `skillName`
+    - Risk profile: low and controllable; fewer accidental writes
+    - Recommended mode: stabilize workflow first with human review/approval
+
+### 9. memoryReflection
+
+- Trigger conditions:
+  - `sessionStrategy` must be `memoryReflection` (explicitly configured).
+  - Trigger event is `command:new` / `command:reset`.
+  - Reflection generation is skipped when session context is incomplete (for example missing `cfg`, session file, or readable conversation content).
+- Reflection runner chain:
+  - First try embedded runner (`runEmbeddedPiAgent`).
+  - If embedded path fails, automatically fallback to `openclaw agent --local --json`.
+  - Only if both fail, write minimal fallback reflection text.
+- Reflect output:
+  - Structured output should include these sections: `## Context`, `## Decisions (durable)`, `## User model deltas (about the human)`, `## Agent model deltas (about the assistant/system)`, `## Lessons & pitfalls (symptom / cause / fix / prevention)`, `## Learning governance candidates (.learnings / promotion / skill extraction)`, `## Open loops / next actions`, `## Retrieval tags / keywords`, `## Invariants`, `## Derived`.
+  - `## Invariants` is for stable rule-like carryover; `## Derived` is for concrete next-run deltas.
+  - Markdown artifacts are written under `memory/reflections/YYYY-MM-DD/`.
+  - Filename uses high-resolution timestamp + agent/session token (with conflict-safe suffix), for example `HHMMSSmmm-agent-session[-xxxxxx].md`.
+- Store to LanceDB (optional):
+  - Controlled by `memoryReflection.storeToLanceDB` (effective only under `sessionStrategy=memoryReflection`).
+  - Only non-fallback reflections are eligible for LanceDB persistence.
+  - Additional similarity dedupe is applied before write (`> 0.97` hit skips storing).
+  - Reflections are stored with category `reflection`, and are displayed as `reflection:<scope>`.
+  - Stored metadata includes reflection execution fields such as `type`, `stage`, `sessionKey`, `sessionId`, `agentId`, `command`, `storedAt`, `invariants[]`, `derived[]`, `usedFallback`, and `errorSignals[]`.
+- Dedicated agent (optional): run reflection generation with another agent via `memoryReflection.agentId` (e.g. `memory-distiller`)
+  - If configured `memoryReflection.agentId` is not found in `cfg.agents.list`, plugin logs a clear warning and falls back to runtime agent id.
+  - For embedded runs, the plugin resolves the target agent's primary model ref (`provider/model`) and passes `provider` + `model` explicitly.
+- Inherit: `before_agent_start` injects `<inherited-rules>` from stable reflection invariants.
+- Derive: `before_prompt_build` injects `<derived-focus>` and `<error-detected>` blocks.
+  - `<derived-focus>` is sourced only from the latest recent non-fallback reflection and skips placeholder lines.
+  - Reflection-derived lines are extracted with `reflect|inherit|derive|change|apply` matching.
+- Error loop: `after_tool_call` captures and deduplicates tool error signatures for reminder/reflection context
+
+### 10. Markdown Mirror (`mdMirror`)
+
+- Purpose:
+  - Dual-write memory entries to readable Markdown files in addition to LanceDB.
+  - Useful for audit/debug/manual review.
+- Write paths:
+  - Preferred: mapped agent workspace `memory/YYYY-MM-DD.md`.
+  - Fallback: `mdMirror.dir` (default: `memory-md`) when agent workspace mapping is unavailable.
+- Trigger points:
+  - `memory_store` tool writes.
+  - Auto-capture writes from `agent_end`.
+- Compatibility:
+  - Does not replace LanceDB storage or retrieval flow.
+  - Existing retrieval remains vector/BM25/rerank based.
+- Config:
+  - `mdMirror.enabled`: enable/disable dual-write (`false` by default).
+  - `mdMirror.dir`: fallback directory for Markdown mirror files.
+
+### 11. Auto-Capture & Auto-Recall
 
 - **Auto-Capture** (`agent_end` hook): Extracts preference/fact/decision/entity from conversations, deduplicates, stores up to 3 per turn
   - Skips memory-management prompts (e.g. delete/forget/cleanup memory entries) to reduce noise
@@ -337,11 +410,12 @@ openclaw config get plugins.slots.memory
   "dbPath": "~/.openclaw/memory/lancedb-pro",
   "autoCapture": true,
   "autoRecall": false,
+  "autoRecallMinLength": 8,
   "retrieval": {
     "mode": "hybrid",
     "vectorWeight": 0.7,
     "bm25Weight": 0.3,
-    "minScore": 0.3,
+    "minScore": 0.45,
     "rerank": "cross-encoder",
     "rerankApiKey": "${JINA_API_KEY}",
     "rerankModel": "jina-reranker-v3",
@@ -352,12 +426,13 @@ openclaw config get plugins.slots.memory
     "recencyWeight": 0.1,
     "filterNoise": true,
     "lengthNormAnchor": 500,
-    "hardMinScore": 0.35,
+    "hardMinScore": 0.55,
     "timeDecayHalfLifeDays": 60,
     "reinforcementFactor": 0.5,
     "maxHalfLifeMultiplier": 3
   },
   "enableManagementTools": false,
+  "sessionStrategy": "systemSessionMemory",
   "scopes": {
     "default": "global",
     "definitions": {
@@ -368,14 +443,55 @@ openclaw config get plugins.slots.memory
       "discord-bot": ["global", "agent:discord-bot"]
     }
   },
-  "sessionMemory": {
+  "selfImprovement": {
+    "enabled": true,
+    "beforeResetNote": true,
+    "skipSubagentBootstrap": true,
+    "ensureLearningFiles": true
+  },
+  "memoryReflection": {
+    "storeToLanceDB": true,
+    "injectMode": "inheritance+derived",
+    "agentId": "memory-distiller",
+    "messageCount": 120,
+    "maxInputChars": 24000,
+    "timeoutMs": 20000,
+    "thinkLevel": "medium",
+    "errorReminderMaxEntries": 3,
+    "dedupeErrorSignals": true
+  },
+  "mdMirror": {
     "enabled": false,
-    "messageCount": 15
+    "dir": "memory-md"
   }
 }
 ```
 
 </details>
+
+### Parameter Mapping Notes (avoid common misconfig)
+
+`memory-lancedb-pro` does **not** support `recallTopK` / `recallThreshold`.
+
+Use these equivalents instead:
+
+- `recallTopK` → `retrieval.candidatePoolSize`
+- `recallThreshold` → combine `retrieval.minScore` + `retrieval.hardMinScore`
+
+A practical starting point for Chinese chat workloads:
+
+```json
+{
+  "autoCapture": true,
+  "autoRecall": true,
+  "autoRecallMinLength": 8,
+  "retrieval": {
+    "candidatePoolSize": 20,
+    "minScore": 0.45,
+    "hardMinScore": 0.55
+  }
+}
+```
 
 ### Access Reinforcement (1.0.26)
 
@@ -519,7 +635,7 @@ and keeps a cursor here:
 
 The script is **safe**: it never modifies session logs.
 
-By default it skips historical reset snapshots (`*.reset.*`) and excludes the distiller agent itself (`memory-distiller`) to prevent self-ingestion loops.
+By default it skips historical reset snapshots (`*.reset.*`), slash-command/control-note lines (for example `/note self-improvement ...`), and excludes the distiller agent itself (`memory-distiller`) to prevent self-ingestion loops.
 
 ### Optional: restrict distillation sources (allowlist)
 
