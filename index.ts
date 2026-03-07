@@ -1564,7 +1564,7 @@ const memoryLanceDBProPlugin = {
           const memoryContext = finalResults
             .map(
               (r) =>
-                `- [${r.entry.category}:${r.entry.scope}] ${sanitizeForContext(r.entry.text)} (${(r.score * 100).toFixed(0)}%${r.sources?.bm25 ? ", vector+BM25" : ""}${r.sources?.reranked ? "+reranked" : ""})`,
+                `- [${r.entry.category}:${r.entry.scope}] ${sanitizeForContext(r.entry.text)}`,
             )
             .join("\n");
 
