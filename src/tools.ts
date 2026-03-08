@@ -78,7 +78,7 @@ interface MemoryItem {
 interface DebugItem {
   id: string;
   score: number;
-  sources?: {
+  sources: {
     vector?: { score: number; rank: number };
     bm25?: { score: number; rank: number };
     fused?: { score: number };
