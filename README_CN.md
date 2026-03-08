@@ -109,6 +109,88 @@ openclaw logs --follow --plain | rg "memory-lancedb-pro"
 }
 ```
 
+### OpenClaw 便捷导入方式（Telegram 直接发给主 Bot）
+
+如果你是在 OpenClaw 的 Telegram 里操作，最便捷的方式不是手动改配置，而是直接对主 Bot 发送一段接入指令。
+
+可直接发送：
+
+```text
+帮我接入该记忆库, 用体验最好的配置：https://github.com/win4r/memory-lancedb-pro
+
+要求：
+1. 直接接成当前唯一启用的 memory 插件
+2. embedding 用 Jina
+3. reranker 用 Jina
+4. 智能提取的 llm 用 gpt-4o-mini
+5. 开启 autoCapture、autoRecall、smartExtraction
+6. extractMinMessages=2
+7. sessionMemory.enabled=false
+8. captureAssistant=false
+9. retrieval 用 hybrid，vectorWeight=0.7，bm25Weight=0.3
+10. rerank=cross-encoder，candidatePoolSize=12，minScore=0.6，hardMinScore=0.62
+11. 生成可直接落到 openclaw.json 的最终配置，不要只给解释
+
+{
+  "embedding": {
+    "provider": "openai-compatible",
+    "apiKey": "${JINA_API_KEY}",
+    "model": "jina-embeddings-v5-text-small",
+    "baseURL": "https://api.jina.ai/v1",
+    "dimensions": 1024,
+    "taskQuery": "retrieval.query",
+    "taskPassage": "retrieval.passage",
+    "normalized": true
+  },
+  "dbPath": "~/.openclaw/memory/lancedb-pro",
+  "autoCapture": true,
+  "autoRecall": true,
+  "captureAssistant": false,
+  "smartExtraction": true,
+  "extractMinMessages": 2,
+  "extractMaxChars": 8000,
+  "sessionMemory": {
+    "enabled": false
+  },
+  "retrieval": {
+    "mode": "hybrid",
+    "vectorWeight": 0.7,
+    "bm25Weight": 0.3,
+    "rerank": "cross-encoder",
+    "rerankProvider": "jina",
+    "rerankEndpoint": "https://api.jina.ai/v1/rerank",
+    "rerankModel": "jina-reranker-v3",
+    "candidatePoolSize": 12,
+    "minScore": 0.6,
+    "hardMinScore": 0.62,
+    "rerankApiKey": "${JINA_API_KEY}"
+  },
+  "llm": {
+    "apiKey": "${OPENAI_API_KEY}",
+    "model": "gpt-4o-mini",
+    "baseURL": "https://api.openai.com/v1"
+  }
+}
+```
+
+如果你已经有自己的 OpenAI-compatible 服务，只需要替换对应区块：
+
+- `embedding`：改 `apiKey` / `model` / `baseURL` / `dimensions`
+- `retrieval`：改 `rerankProvider` / `rerankEndpoint` / `rerankModel` / `rerankApiKey`
+- `llm`：改 `apiKey` / `model` / `baseURL`
+
+例如只替换 LLM：
+
+```json
+{
+  "llm": {
+    "apiKey": "${GROQ_API_KEY}",
+    "model": "openai/gpt-oss-120b",
+    "baseURL": "https://api.groq.com/openai/v1"
+  }
+}
+```
+
 ## 这份 README 适合做什么
 
 这份 README 主要覆盖：
@@ -652,7 +734,7 @@ openclaw config get plugins.slots.memory
   "smartExtraction": true,
   "llm": {
     "apiKey": "${OPENAI_API_KEY}",
-    "model": "openai/gpt-oss-120b",
+    "model": "gpt-4o-mini",
     "baseURL": "https://api.openai.com/v1"
   },
   "extractMinMessages": 2,
@@ -798,7 +880,7 @@ OpenClaw 默认行为补充：
   "smartExtraction": true,
   "llm": {
     "apiKey": "${OPENAI_API_KEY}",
-    "model": "openai/gpt-oss-120b",
+    "model": "gpt-4o-mini",
     "baseURL": "https://api.openai.com/v1"
   },
   "extractMinMessages": 2,

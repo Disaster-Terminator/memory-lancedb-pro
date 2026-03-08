@@ -109,6 +109,88 @@ If your model tends to echo injected memory blocks too aggressively, change only
 }
 ```
 
+### OpenClaw Quick Import via Telegram Main Bot
+
+If you are using OpenClaw's Telegram integration, the easiest way is not to manually edit config but to send an import command directly to the main Bot.
+
+Send this message:
+
+```text
+Help me connect this memory plugin with the best user-experience config: https://github.com/win4r/memory-lancedb-pro
+
+Requirements:
+1. Set it as the only active memory plugin
+2. Use Jina for embedding
+3. Use Jina for reranker
+4. Use gpt-4o-mini for the smart-extraction LLM
+5. Enable autoCapture, autoRecall, smartExtraction
+6. extractMinMessages=2
+7. sessionMemory.enabled=false
+8. captureAssistant=false
+9. retrieval mode=hybrid, vectorWeight=0.7, bm25Weight=0.3
+10. rerank=cross-encoder, candidatePoolSize=12, minScore=0.6, hardMinScore=0.62
+11. Generate the final openclaw.json config directly, not just an explanation
+
+{
+  "embedding": {
+    "provider": "openai-compatible",
+    "apiKey": "${JINA_API_KEY}",
+    "model": "jina-embeddings-v5-text-small",
+    "baseURL": "https://api.jina.ai/v1",
+    "dimensions": 1024,
+    "taskQuery": "retrieval.query",
+    "taskPassage": "retrieval.passage",
+    "normalized": true
+  },
+  "dbPath": "~/.openclaw/memory/lancedb-pro",
+  "autoCapture": true,
+  "autoRecall": true,
+  "captureAssistant": false,
+  "smartExtraction": true,
+  "extractMinMessages": 2,
+  "extractMaxChars": 8000,
+  "sessionMemory": {
+    "enabled": false
+  },
+  "retrieval": {
+    "mode": "hybrid",
+    "vectorWeight": 0.7,
+    "bm25Weight": 0.3,
+    "rerank": "cross-encoder",
+    "rerankProvider": "jina",
+    "rerankEndpoint": "https://api.jina.ai/v1/rerank",
+    "rerankModel": "jina-reranker-v3",
+    "candidatePoolSize": 12,
+    "minScore": 0.6,
+    "hardMinScore": 0.62,
+    "rerankApiKey": "${JINA_API_KEY}"
+  },
+  "llm": {
+    "apiKey": "${OPENAI_API_KEY}",
+    "model": "gpt-4o-mini",
+    "baseURL": "https://api.openai.com/v1"
+  }
+}
+```
+
+If you already have your own OpenAI-compatible services, just replace the relevant block:
+
+- `embedding`: change `apiKey` / `model` / `baseURL` / `dimensions`
+- `retrieval`: change `rerankProvider` / `rerankEndpoint` / `rerankModel` / `rerankApiKey`
+- `llm`: change `apiKey` / `model` / `baseURL`
+
+For example, to replace only the LLM:
+
+```json
+{
+  "llm": {
+    "apiKey": "${GROQ_API_KEY}",
+    "model": "openai/gpt-oss-120b",
+    "baseURL": "https://api.groq.com/openai/v1"
+  }
+}
+```
+
 ## What This README Is For
 
 Use this README for:
@@ -651,7 +733,7 @@ openclaw config get plugins.slots.memory
   "smartExtraction": true,
   "llm": {
     "apiKey": "${OPENAI_API_KEY}",
-    "model": "openai/gpt-oss-120b",
+    "model": "gpt-4o-mini",
     "baseURL": "https://api.openai.com/v1"
   },
   "extractMinMessages": 2,
@@ -797,7 +879,7 @@ When `smartExtraction` is enabled (default: `true`), the plugin uses an LLM to i
   "smartExtraction": true,
   "llm": {
     "apiKey": "${OPENAI_API_KEY}",
-    "model": "openai/gpt-oss-120b",
+    "model": "gpt-4o-mini",
     "baseURL": "https://api.openai.com/v1"
   },
   "extractMinMessages": 2,
