@@ -99,7 +99,7 @@ function sanitizeMemoryForSerialization(
     importance: r.entry.importance,
   }));
 
-  const payload: { memories: typeof memories; debug?: DebugItem[] } = { memories };
+  const payload: { memories: MemoryItem[]; debug?: DebugItem[] } = { memories };
 
   if (exposeRetrievalMetadata) {
     payload.debug = results.map((r) => ({
@@ -440,14 +440,11 @@ export function registerMemoryRecallTool(
             };
           }
 
-          const text = results
-            .map((r, i) => {
-              const categoryTag = getDisplayCategoryTag(r.entry);
-              return `${i + 1}. [${r.entry.id}] [${categoryTag}] ${r.entry.text}`;
-            })
-            .join("\n");
-
           const { memories, debug } = sanitizeMemoryForSerialization(results, context.exposeRetrievalMetadata);
+
+          const text = memories
+            .map((m, i) => `${i + 1}. [${m.id}] [${m.category}] ${m.text}`)
+            .join("\n");
 
           return {
             content: [
@@ -743,14 +740,14 @@ export function registerMemoryForgetTool(
               }
             }
 
-            const list = results
+            const { memories, debug } = sanitizeMemoryForSerialization(results, context.exposeRetrievalMetadata);
+
+            const list = memories
               .map(
-                (r) =>
-                  `- [${r.entry.id.slice(0, 8)}] ${r.entry.text.slice(0, 60)}${r.entry.text.length > 60 ? "..." : ""}`,
+                (m) =>
+                  `- [${m.id.slice(0, 8)}] ${m.text.slice(0, 60)}${m.text.length > 60 ? "..." : ""}`,
               )
               .join("\n");
-
-            const { memories, debug } = sanitizeMemoryForSerialization(results, context.exposeRetrievalMetadata);
 
             return {
               content: [
@@ -873,13 +870,13 @@ export function registerMemoryUpdateTool(
             if (results.length === 1 || results[0].score > 0.85) {
               resolvedId = results[0].entry.id;
             } else {
-              const list = results
+              const { memories, debug } = sanitizeMemoryForSerialization(results, context.exposeRetrievalMetadata);
+              const list = memories
                 .map(
-                  (r) =>
-                    `- [${r.entry.id.slice(0, 8)}] ${r.entry.text.slice(0, 60)}${r.entry.text.length > 60 ? "..." : ""}`,
+                  (m) =>
+                    `- [${m.id.slice(0, 8)}] ${m.text.slice(0, 60)}${m.text.length > 60 ? "..." : ""}`,
                 )
                 .join("\n");
-              const { memories, debug } = sanitizeMemoryForSerialization(results, context.exposeRetrievalMetadata);
               return {
                 content: [
                   {
