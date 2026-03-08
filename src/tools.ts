@@ -78,7 +78,12 @@ interface MemoryItem {
 interface DebugItem {
   id: string;
   score: number;
-  sources?: { vector?: boolean; bm25?: boolean; reranked?: boolean };
+  sources?: {
+    vector?: { score: number; rank: number };
+    bm25?: { score: number; rank: number };
+    fused?: { score: number };
+    reranked?: { score: number };
+  };
 }
 
 function sanitizeMemoryForSerialization(
