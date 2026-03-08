@@ -87,6 +87,7 @@ interface PluginConfig {
     agentAccess?: Record<string, string[]>;
   };
   enableManagementTools?: boolean;
+  exposeRetrievalMetadata?: boolean;
   sessionStrategy?: SessionStrategy;
   sessionMemory?: { enabled?: boolean; messageCount?: number };
   selfImprovement?: {
@@ -1464,6 +1465,7 @@ const memoryLanceDBProPlugin = {
         agentId: undefined, // Will be determined at runtime from context
         workspaceDir: getDefaultWorkspaceDir(),
         mdMirror,
+        exposeRetrievalMetadata: config.exposeRetrievalMetadata,
       },
       {
         enableManagementTools: config.enableManagementTools,
@@ -1564,7 +1566,7 @@ const memoryLanceDBProPlugin = {
           const memoryContext = finalResults
             .map(
               (r) =>
-                `- [${r.entry.category}:${r.entry.scope}] ${sanitizeForContext(r.entry.text)} (${(r.score * 100).toFixed(0)}%${r.sources?.bm25 ? ", vector+BM25" : ""}${r.sources?.reranked ? "+reranked" : ""})`,
+                `- [${r.entry.category}:${r.entry.scope}] ${sanitizeForContext(r.entry.text)}`,
             )
             .join("\n");
 
