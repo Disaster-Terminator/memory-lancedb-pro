@@ -87,6 +87,7 @@ interface PluginConfig {
     agentAccess?: Record<string, string[]>;
   };
   enableManagementTools?: boolean;
+  exposeRetrievalMetadata?: boolean;
   sessionStrategy?: SessionStrategy;
   sessionMemory?: { enabled?: boolean; messageCount?: number };
   selfImprovement?: {

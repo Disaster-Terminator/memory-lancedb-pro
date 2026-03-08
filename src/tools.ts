@@ -69,10 +69,7 @@ function clamp01(value: number, fallback = 0.7): number {
 function sanitizeMemoryForSerialization(
   results: RetrievalResult[],
   exposeRetrievalMetadata?: boolean,
-) {
-  // By default, remove score/sources to avoid leaking retrieval metadata through details.memories
-  // Some clients/hosts display or pass through the details object
-  // When exposeRetrievalMetadata is true, include metadata in a separate debug field
+): { memories: MemoryItem[]; debug?: DebugItem[] } {
   const memories = results.map((r) => ({
     id: r.entry.id,
     text: r.entry.text,
@@ -82,18 +79,32 @@ function sanitizeMemoryForSerialization(
     importance: r.entry.importance,
   }));
 
+  const payload: { memories: typeof memories; debug?: DebugItem[] } = { memories };
+
   if (exposeRetrievalMetadata) {
-    return {
-      memories,
-      debug: results.map((r) => ({
-        id: r.entry.id,
-        score: r.score,
-        sources: r.sources,
-      })),
-    };
+    payload.debug = results.map((r) => ({
+      id: r.entry.id,
+      score: r.score,
+      sources: r.sources,
+    }));
   }
 
-  return memories;
+  return payload;
+}
+
+interface MemoryItem {
+  id: string;
+  text: string;
+  category: string;
+  rawCategory: string;
+  scope: string;
+  importance: number;
+}
+
+interface DebugItem {
+  id: string;
+  score: number;
+  sources?: { bm25?: boolean; reranked?: boolean };
 }
 
 function resolveWorkspaceDir(toolCtx: unknown, fallback?: string): string {
@@ -431,7 +442,7 @@ export function registerMemoryRecallTool(
             })
             .join("\n");
 
-          const serialized = sanitizeMemoryForSerialization(results, context.exposeRetrievalMetadata);
+          const { memories, debug } = sanitizeMemoryForSerialization(results, context.exposeRetrievalMetadata);
 
           return {
             content: [
@@ -442,8 +453,8 @@ export function registerMemoryRecallTool(
             ],
             details: {
               count: results.length,
-              memories: Array.isArray(serialized) ? serialized : serialized.memories,
-              ...(typeof serialized === "object" && "debug" in serialized ? { debug: serialized.debug } : {}),
+              memories,
+              ...(debug ? { debug } : {}),
               query,
               scopes: scopeFilter,
               retrievalMode: context.retriever.getConfig().mode,
@@ -734,7 +745,7 @@ export function registerMemoryForgetTool(
               )
               .join("\n");
 
-            const serialized = sanitizeMemoryForSerialization(results, context.exposeRetrievalMetadata);
+            const { memories, debug } = sanitizeMemoryForSerialization(results, context.exposeRetrievalMetadata);
 
             return {
               content: [
@@ -745,8 +756,8 @@ export function registerMemoryForgetTool(
               ],
               details: {
                 action: "candidates",
-                candidates: Array.isArray(serialized) ? serialized : serialized.memories,
-                ...(typeof serialized === "object" && "debug" in serialized ? { debug: serialized.debug } : {}),
+                candidates: memories,
+                ...(debug ? { debug } : {}),
               },
             };
           }
