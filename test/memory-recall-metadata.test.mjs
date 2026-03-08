@@ -13,25 +13,27 @@ const jiti = jitiFactory(import.meta.url, {
   },
 });
 
-const { registerMemoryRecallTool } = jiti("../src/tools.ts");
+const {
+  registerMemoryRecallTool,
+  registerMemoryForgetTool,
+  registerMemoryUpdateTool,
+} = jiti("../src/tools.ts");
 
-function makeResult() {
-  return [
-    {
-      entry: {
-        id: "m1",
-        text: "remember this",
-        category: "fact",
-        scope: "global",
-        importance: 0.7,
-      },
-      score: 0.82,
-      sources: {
-        vector: { score: 0.82, rank: 1 },
-        bm25: { score: 0.88, rank: 2 },
-      },
+function makeResults(count = 1) {
+  return Array.from({ length: count }, (_, index) => ({
+    entry: {
+      id: `m${index + 1}`,
+      text: `remember this ${index + 1}`,
+      category: "fact",
+      scope: "global",
+      importance: 0.7,
     },
-  ];
+    score: 0.82 - index * 0.01,
+    sources: {
+      vector: { score: 0.82 - index * 0.01, rank: index + 1 },
+      bm25: { score: 0.88 - index * 0.01, rank: index + 2 },
+    },
+  }));
 }
 
 function makeApiCapture() {
@@ -45,17 +47,24 @@ function makeApiCapture() {
   return { api, getCreator: () => capturedCreator };
 }
 
-function makeContext({ expose = false } = {}) {
+function makeContext({ expose = false, results = makeResults() } = {}) {
   return {
     retriever: {
       async retrieve() {
-        return makeResult();
+        return results;
       },
       getConfig() {
         return { mode: "hybrid" };
       },
     },
-    store: {},
+    store: {
+      async delete() {
+        return true;
+      },
+      async update() {
+        return true;
+      },
+    },
     scopeManager: {
       getAccessibleScopes: () => ["global"],
       isAccessible: () => true,
@@ -69,35 +78,77 @@ function makeContext({ expose = false } = {}) {
   };
 }
 
-describe("memory_recall exposeRetrievalMetadata", () => {
-  it("does not include debug when exposeRetrievalMetadata=false", async () => {
-    const { api, getCreator } = makeApiCapture();
-    const context = makeContext({ expose: false });
-    registerMemoryRecallTool(api, context);
-    const creator = getCreator();
-    assert.ok(typeof creator === "function");
-    const tool = creator({});
+function createTool(registerTool, context) {
+  const { api, getCreator } = makeApiCapture();
+  registerTool(api, context);
+  const creator = getCreator();
+  assert.ok(typeof creator === "function");
+  return creator({});
+}
+
+describe("memory metadata exposure", () => {
+  it("keeps memory_recall text clean when exposeRetrievalMetadata=false", async () => {
+    const tool = createTool(
+      registerMemoryRecallTool,
+      makeContext({ expose: false, results: makeResults(1) }),
+    );
+
     const res = await tool.execute(null, { query: "test" });
+
     assert.equal(res.details.count, 1);
     assert.ok(Array.isArray(res.details.memories));
     assert.equal(res.details.debug, undefined);
-    // memory items should not include score/sources
     assert.equal(Object.prototype.hasOwnProperty.call(res.details.memories[0], "score"), false);
     assert.equal(Object.prototype.hasOwnProperty.call(res.details.memories[0], "sources"), false);
+    assert.match(res.content[0].text, /remember this 1/);
+    assert.doesNotMatch(res.content[0].text, /82%|vector|BM25|reranked/);
   });
 
-  it("includes debug when exposeRetrievalMetadata=true", async () => {
-    const { api, getCreator } = makeApiCapture();
-    const context = makeContext({ expose: true });
-    registerMemoryRecallTool(api, context);
-    const creator = getCreator();
-    assert.ok(typeof creator === "function");
-    const tool = creator({});
+  it("exposes debug metadata without polluting memory_recall text when enabled", async () => {
+    const tool = createTool(
+      registerMemoryRecallTool,
+      makeContext({ expose: true, results: makeResults(1) }),
+    );
+
     const res = await tool.execute(null, { query: "test" });
+
     assert.equal(res.details.count, 1);
     assert.ok(Array.isArray(res.details.memories));
     assert.ok(Array.isArray(res.details.debug));
     assert.equal(typeof res.details.debug[0].score, "number");
     assert.ok(res.details.debug[0].sources.vector);
+    assert.doesNotMatch(res.content[0].text, /82%|vector|BM25|reranked/);
+  });
+
+  it("preserves details.candidates for memory_forget while attaching debug metadata separately", async () => {
+    const tool = createTool(
+      registerMemoryForgetTool,
+      makeContext({ expose: true, results: makeResults(2) }),
+    );
+
+    const res = await tool.execute(null, { query: "test" });
+
+    assert.equal(res.details.action, "candidates");
+    assert.ok(Array.isArray(res.details.candidates));
+    assert.equal(res.details.memories, undefined);
+    assert.ok(Array.isArray(res.details.debug));
+    assert.equal(Object.prototype.hasOwnProperty.call(res.details.candidates[0], "score"), false);
+    assert.equal(Object.prototype.hasOwnProperty.call(res.details.candidates[0], "sources"), false);
+  });
+
+  it("preserves details.candidates for memory_update while attaching debug metadata separately", async () => {
+    const tool = createTool(
+      registerMemoryUpdateTool,
+      makeContext({ expose: true, results: makeResults(2) }),
+    );
+
+    const res = await tool.execute(null, { memoryId: "test", text: "updated text" });
+
+    assert.equal(res.details.action, "candidates");
+    assert.ok(Array.isArray(res.details.candidates));
+    assert.equal(res.details.memories, undefined);
+    assert.ok(Array.isArray(res.details.debug));
+    assert.equal(Object.prototype.hasOwnProperty.call(res.details.candidates[0], "score"), false);
+    assert.equal(Object.prototype.hasOwnProperty.call(res.details.candidates[0], "sources"), false);
   });
 });

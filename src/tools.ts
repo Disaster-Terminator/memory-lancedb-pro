@@ -66,31 +66,50 @@ function clamp01(value: number, fallback = 0.7): number {
   return Math.min(1, Math.max(0, value));
 }
 
-function sanitizeMemoryForSerialization(
+type SerializedMemory = {
+  id: string;
+  text: string;
+  category: string;
+  rawCategory: string;
+  scope: string;
+  importance: number;
+};
+
+type DebugMemory = {
+  id: string;
+  score: number;
+  sources: RetrievalResult["sources"];
+};
+
+type SerializedMemoryPayload = {
+  memories: SerializedMemory[];
+  debug?: DebugMemory[];
+};
+
+function buildSanitizedMemoryPayload(
   results: RetrievalResult[],
   exposeRetrievalMetadata?: boolean,
-): { memories: Array<{ id: string; text: string; category: string; rawCategory: string; scope: string; importance: number }>; debug?: Array<{ id: string; score: number; sources: RetrievalResult["sources"] }> } {
-  const memories = results.map((r) => ({
-    id: r.entry.id,
-    text: r.entry.text,
-    category: getDisplayCategoryTag(r.entry),
-    rawCategory: r.entry.category,
-    scope: r.entry.scope,
-    importance: r.entry.importance,
-  }));
+): SerializedMemoryPayload {
+  const payload: SerializedMemoryPayload = {
+    memories: results.map((r) => ({
+      id: r.entry.id,
+      text: r.entry.text,
+      category: getDisplayCategoryTag(r.entry),
+      rawCategory: r.entry.category,
+      scope: r.entry.scope,
+      importance: r.entry.importance,
+    })),
+  };
 
   if (exposeRetrievalMetadata) {
-    return {
-      memories,
-      debug: results.map((r) => ({
-        id: r.entry.id,
-        score: r.score,
-        sources: r.sources,
-      })),
-    };
+    payload.debug = results.map((r) => ({
+      id: r.entry.id,
+      score: r.score,
+      sources: r.sources,
+    }));
   }
 
-  return { memories };
+  return payload;
 }
 
 function resolveWorkspaceDir(toolCtx: unknown, fallback?: string): string {
@@ -423,15 +442,15 @@ export function registerMemoryRecallTool(
 
           const text = results
             .map((r, i) => {
-              const sources = [];
-              if (r.sources.vector) sources.push("vector");
-              if (r.sources.bm25) sources.push("BM25");
-              if (r.sources.reranked) sources.push("reranked");
-
               const categoryTag = getDisplayCategoryTag(r.entry);
-              return `${i + 1}. [${r.entry.id}] [${categoryTag}] ${r.entry.text} (${(r.score * 100).toFixed(0)}%${sources.length > 0 ? `, ${sources.join("+")}` : ""})`;
+              return `${i + 1}. [${r.entry.id}] [${categoryTag}] ${r.entry.text}`;
             })
             .join("\n");
+
+          const serialized = buildSanitizedMemoryPayload(
+            results,
+            context.exposeRetrievalMetadata,
+          );
 
           return {
             content: [
@@ -442,7 +461,8 @@ export function registerMemoryRecallTool(
             ],
             details: {
               count: results.length,
-              ...sanitizeMemoryForSerialization(results, context.exposeRetrievalMetadata),
+              memories: serialized.memories,
+              ...(serialized.debug ? { debug: serialized.debug } : {}),
               query,
               scopes: scopeFilter,
               retrievalMode: context.retriever.getConfig().mode,
@@ -733,6 +753,11 @@ export function registerMemoryForgetTool(
               )
               .join("\n");
 
+            const serialized = buildSanitizedMemoryPayload(
+              results,
+              context.exposeRetrievalMetadata,
+            );
+
             return {
               content: [
                 {
@@ -742,7 +767,8 @@ export function registerMemoryForgetTool(
               ],
               details: {
                 action: "candidates",
-                ...sanitizeMemoryForSerialization(results, context.exposeRetrievalMetadata),
+                candidates: serialized.memories,
+                ...(serialized.debug ? { debug: serialized.debug } : {}),
               },
             };
           }
@@ -859,6 +885,11 @@ export function registerMemoryUpdateTool(
                     `- [${r.entry.id.slice(0, 8)}] ${r.entry.text.slice(0, 60)}${r.entry.text.length > 60 ? "..." : ""}`,
                 )
                 .join("\n");
+              const serialized = buildSanitizedMemoryPayload(
+                results,
+                context.exposeRetrievalMetadata,
+              );
+
               return {
                 content: [
                   {
@@ -868,7 +899,8 @@ export function registerMemoryUpdateTool(
                 ],
                 details: {
                   action: "candidates",
-                  ...sanitizeMemoryForSerialization(results, context.exposeRetrievalMetadata),
+                  candidates: serialized.memories,
+                  ...(serialized.debug ? { debug: serialized.debug } : {}),
                 },
               };
             }
