@@ -2,7 +2,7 @@
   "id": "memory-lancedb-pro",
   "name": "Memory (LanceDB Pro)",
   "description": "Enhanced LanceDB-backed long-term memory with hybrid retrieval, multi-scope isolation, long-context chunking, and management CLI",
-  "version": "1.1.0-beta.4",
+  "version": "1.1.0-beta.5",
   "kind": "memory",
   "configSchema": {
     "type": "object",
@@ -278,10 +278,6 @@
         "additionalProperties": false,
         "properties": {
           "storeToLanceDB": {
-            "type": "boolean",
-            "default": true
-          },
-          "writeLegacyCombined": {
             "type": "boolean",
             "default": true
           },
@@ -569,11 +565,6 @@
     "memoryReflection.storeToLanceDB": {
       "label": "Store Reflection To LanceDB",
       "help": "Persist reflection event + item rows to LanceDB (effective only under memoryReflection strategy)",
-      "advanced": true
-    },
-    "memoryReflection.writeLegacyCombined": {
-      "label": "Write Legacy Combined Reflection",
-      "help": "Compatibility switch: also write legacy combined memory-reflection rows during migration.",
       "advanced": true
     },
     "memoryReflection.injectMode": {

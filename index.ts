@@ -29,11 +29,13 @@ import { resolveReflectionSessionSearchDirs, stripResetSuffix } from "./src/sess
 import {
   storeReflectionToLanceDB,
   loadAgentReflectionSlicesFromEntries,
+  loadAgentDerivedRowsWithScoresFromEntries,
   DEFAULT_REFLECTION_DERIVED_MAX_AGE_MS,
 } from "./src/reflection-store.js";
 import {
   extractReflectionLearningGovernanceCandidates,
   extractReflectionMappedMemoryItems,
+  extractReflectionOpenLoops,
 } from "./src/reflection-slices.js";
 import { createReflectionEventId } from "./src/reflection-event-store.js";
 import { buildReflectionMappedMetadata } from "./src/reflection-mapped-metadata.js";
@@ -98,7 +100,6 @@ interface PluginConfig {
   memoryReflection?: {
     enabled?: boolean;
     storeToLanceDB?: boolean;
-    writeLegacyCombined?: boolean;
     injectMode?: ReflectionInjectMode;
     agentId?: string;
     messageCount?: number;
@@ -187,6 +188,57 @@ const DEFAULT_REFLECTION_MAX_TRACKED_SESSIONS = 200;
 const DEFAULT_REFLECTION_ERROR_SCAN_MAX_CHARS = 8_000;
 const REFLECTION_FALLBACK_MARKER = "(fallback) Reflection generation failed; storing minimal pointer only.";
 const DIAG_BUILD_TAG = "memory-lancedb-pro-diag-20260308-0058";
+
+function buildReflectionDerivedFocusBlock(derivedLines: string[]): string {
+  const trimmed = derivedLines
+    .map((line) => line.trim())
+    .filter((line) => line.length > 0)
+    .slice(0, 6);
+  if (trimmed.length === 0) return "";
+  return [
+    "<derived-focus>",
+    "Weighted recent derived execution deltas from reflection memory:",
+    ...trimmed.map((line, i) => `${i + 1}. ${line}`),
+    "</derived-focus>",
+  ].join("\n");
+}
+
+function buildReflectionOpenLoopsBlock(openLoopLines: string[]): string {
+  const trimmed = openLoopLines
+    .map((line) => line.trim())
+    .filter((line) => line.length > 0)
+    .slice(0, 6);
+  if (trimmed.length === 0) return "";
+  return [
+    "<open-loops>",
+    "Fresh open loops / next actions from this reflection run:",
+    ...trimmed.map((line, i) => `${i + 1}. ${line}`),
+    "</open-loops>",
+  ].join("\n");
+}
+
+function buildSelfImprovementResetNote(params?: { openLoopsBlock?: string; derivedFocusBlock?: string }): string {
+  const openLoopsBlock = typeof params?.openLoopsBlock === "string" ? params.openLoopsBlock : "";
+  const derivedFocusBlock = typeof params?.derivedFocusBlock === "string" ? params.derivedFocusBlock : "";
+  const base = [
+    SELF_IMPROVEMENT_NOTE_PREFIX,
+    "- If anything was learned/corrected, log it now:",
+    "  - .learnings/LEARNINGS.md (corrections/best practices)",
+    "  - .learnings/ERRORS.md (failures/root causes)",
+    "- Distill reusable rules to AGENTS.md / SOUL.md / TOOLS.md.",
+    "- If reusable across tasks, extract a new skill from the learning.",
+  ];
+  if (openLoopsBlock) {
+    base.push("- Fresh run handoff:");
+    base.push(openLoopsBlock);
+  }
+  if (derivedFocusBlock) {
+    base.push("- Historical reflection-derived focus:");
+    base.push(derivedFocusBlock);
+  }
+  base.push("- Then proceed with the new session.");
+  return base.join("\n");
+}
 
 type ReflectionErrorSignal = {
   at: number;
@@ -1347,7 +1399,6 @@ const memoryLanceDBProPlugin = {
     const migrator = createMigrator(store);
 
     const reflectionErrorStateBySession = new Map<string, ReflectionErrorState>();
-    const reflectionDerivedBySession = new Map<string, { updatedAt: number; derived: string[] }>();
     const reflectionByAgentCache = new Map<string, { updatedAt: number; invariants: string[]; derived: string[] }>();
 
     const pruneOldestByUpdatedAt = <T extends { updatedAt: number }>(map: Map<string, T>, maxSize: number) => {
@@ -1366,13 +1417,7 @@ const memoryLanceDBProPlugin = {
           reflectionErrorStateBySession.delete(key);
         }
       }
-      for (const [key, state] of reflectionDerivedBySession.entries()) {
-        if (now - state.updatedAt > DEFAULT_REFLECTION_SESSION_TTL_MS) {
-          reflectionDerivedBySession.delete(key);
-        }
-      }
       pruneOldestByUpdatedAt(reflectionErrorStateBySession, DEFAULT_REFLECTION_MAX_TRACKED_SESSIONS);
-      pruneOldestByUpdatedAt(reflectionDerivedBySession, DEFAULT_REFLECTION_MAX_TRACKED_SESSIONS);
     };
 
     const getReflectionErrorState = (sessionKey: string): ReflectionErrorState => {
@@ -1700,7 +1745,72 @@ const memoryLanceDBProPlugin = {
     // Integrated Self-Improvement (inheritance + derived)
     // ========================================================================
 
+    const COMMAND_HOOK_EVENT_MARKER_PREFIX = "__memoryLanceDbProCommandHandled__";
+    const markCommandHookEventHandled = (event: unknown, marker: string): boolean => {
+      if (!event || typeof event !== "object") return false;
+      const target = event as Record<string, unknown>;
+      if (target[marker] === true) return true;
+      try {
+        Object.defineProperty(target, marker, {
+          value: true,
+          enumerable: false,
+          configurable: true,
+          writable: true,
+        });
+      } catch {
+        target[marker] = true;
+      }
+      return false;
+    };
+
+    const registerDurableCommandHook = (
+      eventName: "command:new" | "command:reset",
+      handler: (event: any) => Promise<unknown> | unknown,
+      options: { name: string; description: string },
+      markerSuffix: string,
+    ) => {
+      const marker = `${COMMAND_HOOK_EVENT_MARKER_PREFIX}${markerSuffix}:${eventName}`;
+      const wrapped = async (event: any) => {
+        if (markCommandHookEventHandled(event, marker)) return;
+        return await handler(event);
+      };
+
+      let registeredViaEventBus = false;
+      let registeredViaInternalHook = false;
+
+      const onFn = (api as any).on;
+      if (typeof onFn === "function") {
+        try {
+          onFn.call(api, eventName, wrapped, { priority: 12 });
+          registeredViaEventBus = true;
+        } catch (err) {
+          api.logger.warn(
+            `memory-lancedb-pro: failed to register ${eventName} via api.on, continue fallback: ${String(err)}`,
+          );
+        }
+      }
+
+      const registerHookFn = (api as any).registerHook;
+      if (typeof registerHookFn === "function") {
+        try {
+          registerHookFn.call(api, eventName, wrapped, options);
+          registeredViaInternalHook = true;
+        } catch (err) {
+          api.logger.warn(
+            `memory-lancedb-pro: failed to register ${eventName} via api.registerHook: ${String(err)}`,
+          );
+        }
+      }
+
+      if (!registeredViaEventBus && !registeredViaInternalHook) {
+        api.logger.warn(
+          `memory-lancedb-pro: command hook registration failed for ${eventName}; no compatible API method available`,
+        );
+      }
+    };
+
     if (config.selfImprovement?.enabled !== false) {
+      let registeredBeforeResetNoteHooks = false;
       api.registerHook("agent:bootstrap", async (event) => {
         try {
           const context = (event.context || {}) as Record<string, unknown>;
@@ -1743,7 +1853,8 @@ const memoryLanceDBProPlugin = {
         description: "Inject self-improvement reminder on agent bootstrap",
       });
 
-      if (config.selfImprovement?.beforeResetNote !== false) {
+      if (config.selfImprovement?.beforeResetNote !== false && config.sessionStrategy !== "memoryReflection") {
+        registeredBeforeResetNoteHooks = true;
         const appendSelfImprovementNote = async (event: any) => {
           try {
             const action = String(event?.action || "unknown");
@@ -1768,17 +1879,7 @@ const memoryLanceDBProPlugin = {
               return;
             }
 
-            event.messages.push(
-              [
-                SELF_IMPROVEMENT_NOTE_PREFIX,
-                "- If anything was learned/corrected, log it now:",
-                "  - .learnings/LEARNINGS.md (corrections/best practices)",
-                "  - .learnings/ERRORS.md (failures/root causes)",
-                "- Distill reusable rules to AGENTS.md / SOUL.md / TOOLS.md.",
-                "- If reusable across tasks, extract a new skill from the learning.",
-                "- Then proceed with the new session.",
-              ].join("\n")
-            );
+            event.messages.push(buildSelfImprovementResetNote());
             api.logger.info(
               `self-improvement: command:${action} injected note; messages=${event.messages.length}`
             );
@@ -1787,17 +1888,28 @@ const memoryLanceDBProPlugin = {
           }
         };
 
-        api.registerHook("command:new", appendSelfImprovementNote, {
+        const selfImprovementNewHookOptions = {
           name: "memory-lancedb-pro.self-improvement.command-new",
           description: "Append self-improvement note before /new",
-        });
-        api.registerHook("command:reset", appendSelfImprovementNote, {
+        } as const;
+        const selfImprovementResetHookOptions = {
           name: "memory-lancedb-pro.self-improvement.command-reset",
           description: "Append self-improvement note before /reset",
-        });
+        } as const;
+        registerDurableCommandHook("command:new", appendSelfImprovementNote, selfImprovementNewHookOptions, "self-improvement");
+        registerDurableCommandHook("command:reset", appendSelfImprovementNote, selfImprovementResetHookOptions, "self-improvement");
+        api.on("gateway_start", () => {
+          registerDurableCommandHook("command:new", appendSelfImprovementNote, selfImprovementNewHookOptions, "self-improvement");
+          registerDurableCommandHook("command:reset", appendSelfImprovementNote, selfImprovementResetHookOptions, "self-improvement");
+          api.logger.info("self-improvement: command hooks refreshed after gateway_start");
+        }, { priority: 12 });
       }
 
-      api.logger.info("self-improvement: integrated hooks registered (agent:bootstrap, command:new, command:reset)");
+      api.logger.info(
+        registeredBeforeResetNoteHooks
+          ? "self-improvement: integrated hooks registered (agent:bootstrap, command:new, command:reset)"
+          : "self-improvement: integrated hooks registered (agent:bootstrap)"
+      );
     }
 
     // ========================================================================
@@ -1815,8 +1927,34 @@ const memoryLanceDBProPlugin = {
       const reflectionDedupeErrorSignals = config.memoryReflection?.dedupeErrorSignals !== false;
       const reflectionInjectMode = config.memoryReflection?.injectMode ?? "inheritance+derived";
       const reflectionStoreToLanceDB = config.memoryReflection?.storeToLanceDB !== false;
-      const reflectionWriteLegacyCombined = config.memoryReflection?.writeLegacyCombined !== false;
       const warnedInvalidReflectionAgentIds = new Set<string>();
+      const reflectionTriggerSeenAt = new Map<string, number>();
+      const REFLECTION_TRIGGER_DEDUPE_MS = 12_000;
+
+      const pruneReflectionTriggerSeenAt = () => {
+        const now = Date.now();
+        for (const [key, ts] of reflectionTriggerSeenAt.entries()) {
+          if (now - ts > REFLECTION_TRIGGER_DEDUPE_MS * 3) {
+            reflectionTriggerSeenAt.delete(key);
+          }
+        }
+      };
+
+      const isDuplicateReflectionTrigger = (key: string): boolean => {
+        pruneReflectionTriggerSeenAt();
+        const now = Date.now();
+        const prev = reflectionTriggerSeenAt.get(key);
+        reflectionTriggerSeenAt.set(key, now);
+        return typeof prev === "number" && (now - prev) < REFLECTION_TRIGGER_DEDUPE_MS;
+      };
+
+      const parseSessionIdFromSessionFile = (sessionFile: string | undefined): string | undefined => {
+        if (!sessionFile) return undefined;
+        const fileName = basename(sessionFile);
+        const stripped = fileName.replace(/\.jsonl(?:\.reset\..+)?$/i, "");
+        if (!stripped || stripped === fileName) return undefined;
+        return stripped;
+      };
 
       const resolveReflectionRunAgentId = (cfg: unknown, sourceAgentId: string): string => {
         if (!reflectionAgentId) return sourceAgentId;
@@ -1895,56 +2033,26 @@ const memoryLanceDBProPlugin = {
       api.on("before_prompt_build", async (_event, ctx) => {
         const sessionKey = typeof ctx.sessionKey === "string" ? ctx.sessionKey : "";
         if (isInternalReflectionSessionKey(sessionKey)) return;
-        const agentId = typeof ctx.agentId === "string" && ctx.agentId.trim() ? ctx.agentId.trim() : "main";
         pruneReflectionSessionState();
 
-        const blocks: string[] = [];
-        if (reflectionInjectMode === "inheritance+derived") {
-          try {
-            const scopes = scopeManager.getAccessibleScopes(agentId);
-            const derivedCache = sessionKey ? reflectionDerivedBySession.get(sessionKey) : null;
-            const derivedLines = derivedCache?.derived?.length
-              ? derivedCache.derived
-              : (await loadAgentReflectionSlices(agentId, scopes)).derived;
-            if (derivedLines.length > 0) {
-              blocks.push(
-                [
-                  "<derived-focus>",
-                  "Weighted recent derived execution deltas from reflection memory:",
-                  ...derivedLines.slice(0, 6).map((line, i) => `${i + 1}. ${line}`),
-                  "</derived-focus>",
-                ].join("\n")
-              );
-            }
-          } catch (err) {
-            api.logger.warn(`memory-reflection: derived injection failed: ${String(err)}`);
-          }
-        }
-
-        if (sessionKey) {
-          const pending = getPendingReflectionErrorSignalsForPrompt(sessionKey, reflectionErrorReminderMaxEntries);
-          if (pending.length > 0) {
-            blocks.push(
-              [
-                "<error-detected>",
-                "A tool error was detected. Consider logging this to `.learnings/ERRORS.md` if it is non-trivial or likely to recur.",
-                "Recent error signals:",
-                ...pending.map((e, i) => `${i + 1}. [${e.toolName}] ${e.summary}`),
-                "</error-detected>",
-              ].join("\n")
-            );
-          }
-        }
-
-        if (blocks.length === 0) return;
-        return { prependContext: blocks.join("\n\n") };
+        if (!sessionKey) return;
+        const pending = getPendingReflectionErrorSignalsForPrompt(sessionKey, reflectionErrorReminderMaxEntries);
+        if (pending.length === 0) return;
+        return {
+          prependContext: [
+            "<error-detected>",
+            "A tool error was detected. Consider logging this to `.learnings/ERRORS.md` if it is non-trivial or likely to recur.",
+            "Recent error signals:",
+            ...pending.map((e, i) => `${i + 1}. [${e.toolName}] ${e.summary}`),
+            "</error-detected>",
+          ].join("\n"),
+        };
       }, { priority: 15 });
 
       api.on("session_end", (_event, ctx) => {
         const sessionKey = typeof ctx.sessionKey === "string" ? ctx.sessionKey.trim() : "";
         if (!sessionKey) return;
         reflectionErrorStateBySession.delete(sessionKey);
-        reflectionDerivedBySession.delete(sessionKey);
         pruneReflectionSessionState();
       }, { priority: 20 });
 
@@ -1966,6 +2074,13 @@ const memoryLanceDBProPlugin = {
           let currentSessionFile = typeof sessionEntry.sessionFile === "string" ? sessionEntry.sessionFile : undefined;
           const sourceAgentId = parseAgentIdFromSessionKey(sessionKey) || "main";
           const commandSource = typeof context.commandSource === "string" ? context.commandSource : "";
+          const triggerKey = `${String(event?.action || "unknown")}|${sessionKey || "(none)"}|${currentSessionFile || currentSessionId || "unknown"}`;
+          if (isDuplicateReflectionTrigger(triggerKey)) {
+            api.logger.info(
+              `memory-reflection: duplicate trigger skipped; key=${triggerKey}`
+            );
+            return;
+          }
           api.logger.info(
             `memory-reflection: command:${action} hook start; sessionKey=${sessionKey || "(none)"}; source=${commandSource || "(unknown)"}; sessionId=${currentSessionId}; sessionFile=${currentSessionFile || "(none)"}`
           );
@@ -2055,6 +2170,41 @@ const memoryLanceDBProPlugin = {
               `memory-reflection: fallback used for session ${currentSessionId}` +
               (reflectionGenerated.error ? ` (${reflectionGenerated.error})` : "")
             );
+          }
+
+          let openLoopsBlock = "";
+          let derivedFocusBlock = "";
+          if (reflectionInjectMode === "inheritance+derived") {
+            openLoopsBlock = buildReflectionOpenLoopsBlock(extractReflectionOpenLoops(reflectionText));
+            try {
+              const scopes = scopeManager.getAccessibleScopes(sourceAgentId);
+              const historicalEntries = await store.list(scopes, undefined, 160, 0);
+              const historicalDerivedRows = loadAgentDerivedRowsWithScoresFromEntries({
+                entries: historicalEntries,
+                agentId: sourceAgentId,
+                now: nowTs,
+                deriveMaxAgeMs: DEFAULT_REFLECTION_DERIVED_MAX_AGE_MS,
+                limit: 10,
+              });
+              const historicalDerivedLines = historicalDerivedRows
+                .filter((row) => row.score > 0.3)
+                .map((row) => row.text);
+              derivedFocusBlock = buildReflectionDerivedFocusBlock(historicalDerivedLines);
+            } catch (err) {
+              api.logger.warn(`memory-reflection: derived-focus note build failed: ${String(err)}`);
+            }
+          }
+
+          if (config.selfImprovement?.enabled !== false && config.selfImprovement?.beforeResetNote !== false) {
+            if (!Array.isArray(event.messages)) {
+              api.logger.warn(`memory-reflection: command:${action} missing event.messages array; skip note inject`);
+            } else {
+              const exists = event.messages.some((m: unknown) => typeof m === "string" && m.includes(SELF_IMPROVEMENT_NOTE_PREFIX));
+              if (!exists) {
+                event.messages.push(buildSelfImprovementResetNote({ openLoopsBlock, derivedFocusBlock }));
+                api.logger.info(`memory-reflection: command:${action} injected handoff note; messages=${event.messages.length}`);
+              }
+            }
           }
 
           const header = [
@@ -2166,7 +2316,7 @@ const memoryLanceDBProPlugin = {
           }
 
           if (reflectionStoreToLanceDB) {
-            const stored = await storeReflectionToLanceDB({
+            await storeReflectionToLanceDB({
               reflectionText,
               sessionKey,
               sessionId: currentSessionId || "unknown",
@@ -2178,23 +2328,12 @@ const memoryLanceDBProPlugin = {
               usedFallback: reflectionGenerated.usedFallback,
               eventId: reflectionEventId,
               sourceReflectionPath: relPath,
-              writeLegacyCombined: reflectionWriteLegacyCombined,
               embedPassage: (text) => embedder.embedPassage(text),
-              vectorSearch: (vector, limit, minScore, scopeFilter) =>
-                store.vectorSearch(vector, limit, minScore, scopeFilter),
               store: (entry) => store.store(entry),
             });
-            if (sessionKey && stored.slices.derived.length > 0) {
-              reflectionDerivedBySession.set(sessionKey, {
-                updatedAt: nowTs,
-                derived: stored.slices.derived,
-              });
-            }
             for (const cacheKey of reflectionByAgentCache.keys()) {
               if (cacheKey.startsWith(`${sourceAgentId}::`)) reflectionByAgentCache.delete(cacheKey);
             }
-          } else if (sessionKey && reflectionGenerated.usedFallback) {
-            reflectionDerivedBySession.delete(sessionKey);
           }
 
           const dailyPath = join(workspaceDir, "memory", `${dateStr}.md`);
@@ -2212,14 +2351,46 @@ const memoryLanceDBProPlugin = {
         }
       };
 
-      api.registerHook("command:new", runMemoryReflection, {
+      const memoryReflectionNewHookOptions = {
         name: "memory-lancedb-pro.memory-reflection.command-new",
         description: "Generate reflection log before /new",
-      });
-      api.registerHook("command:reset", runMemoryReflection, {
+      } as const;
+      const memoryReflectionResetHookOptions = {
         name: "memory-lancedb-pro.memory-reflection.command-reset",
         description: "Generate reflection log before /reset",
-      });
+      } as const;
+      registerDurableCommandHook("command:new", runMemoryReflection, memoryReflectionNewHookOptions, "memory-reflection");
+      registerDurableCommandHook("command:reset", runMemoryReflection, memoryReflectionResetHookOptions, "memory-reflection");
+      api.on("gateway_start", () => {
+        registerDurableCommandHook("command:new", runMemoryReflection, memoryReflectionNewHookOptions, "memory-reflection");
+        registerDurableCommandHook("command:reset", runMemoryReflection, memoryReflectionResetHookOptions, "memory-reflection");
+        api.logger.info("memory-reflection: command hooks refreshed after gateway_start");
+      }, { priority: 12 });
+      api.on("before_reset", async (event, ctx) => {
+        try {
+          const actionRaw = typeof event.reason === "string" ? event.reason.trim().toLowerCase() : "reset";
+          const action = actionRaw === "new" ? "new" : "reset";
+          const sessionFile = typeof event.sessionFile === "string" ? event.sessionFile : undefined;
+          const sessionId = parseSessionIdFromSessionFile(sessionFile) ?? "unknown";
+          await runMemoryReflection({
+            action,
+            sessionKey: typeof ctx.sessionKey === "string" ? ctx.sessionKey : "",
+            timestamp: Date.now(),
+            messages: Array.isArray(event.messages) ? event.messages : [],
+            context: {
+              cfg: api.config,
+              workspaceDir: ctx.workspaceDir,
+              commandSource: `lifecycle:before_reset:${action}`,
+              sessionEntry: {
+                sessionId,
+                sessionFile,
+              },
+            },
+          });
+        } catch (err) {
+          api.logger.warn(`memory-reflection: before_reset fallback failed: ${String(err)}`);
+        }
+      }, { priority: 12 });
       api.logger.info("memory-reflection: integrated hooks registered (command:new, command:reset, after_tool_call, before_agent_start, before_prompt_build)");
     }
 
@@ -2509,7 +2680,6 @@ export function parsePluginConfig(value: unknown): PluginConfig {
       ? {
         enabled: sessionStrategy === "memoryReflection",
         storeToLanceDB: reflectionStoreToLanceDB,
-        writeLegacyCombined: memoryReflectionRaw.writeLegacyCombined !== false,
         injectMode: reflectionInjectMode,
         agentId: asNonEmptyString(memoryReflectionRaw.agentId),
         messageCount: reflectionMessageCount,
@@ -2526,7 +2696,6 @@ export function parsePluginConfig(value: unknown): PluginConfig {
       : {
         enabled: sessionStrategy === "memoryReflection",
         storeToLanceDB: reflectionStoreToLanceDB,
-        writeLegacyCombined: true,
         injectMode: "inheritance+derived",
         agentId: undefined,
         messageCount: reflectionMessageCount,
