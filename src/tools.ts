@@ -104,7 +104,7 @@ interface MemoryItem {
 interface DebugItem {
   id: string;
   score: number;
-  sources?: { bm25?: boolean; reranked?: boolean };
+  sources?: { vector?: boolean; bm25?: boolean; reranked?: boolean };
 }
 
 function resolveWorkspaceDir(toolCtx: unknown, fallback?: string): string {
