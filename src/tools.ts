@@ -66,6 +66,21 @@ function clamp01(value: number, fallback = 0.7): number {
   return Math.min(1, Math.max(0, value));
 }
 
+interface MemoryItem {
+  id: string;
+  text: string;
+  category: string;
+  rawCategory: string;
+  scope: string;
+  importance: number;
+}
+
+interface DebugItem {
+  id: string;
+  score: number;
+  sources?: { vector?: boolean; bm25?: boolean; reranked?: boolean };
+}
+
 function sanitizeMemoryForSerialization(
   results: RetrievalResult[],
   exposeRetrievalMetadata?: boolean,
@@ -90,21 +105,6 @@ function sanitizeMemoryForSerialization(
   }
 
   return payload;
-}
-
-interface MemoryItem {
-  id: string;
-  text: string;
-  category: string;
-  rawCategory: string;
-  scope: string;
-  importance: number;
-}
-
-interface DebugItem {
-  id: string;
-  score: number;
-  sources?: { vector?: boolean; bm25?: boolean; reranked?: boolean };
 }
 
 function resolveWorkspaceDir(toolCtx: unknown, fallback?: string): string {
