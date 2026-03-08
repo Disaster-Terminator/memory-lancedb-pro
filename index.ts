@@ -20,12 +20,23 @@ import { createRetriever, DEFAULT_RETRIEVAL_CONFIG } from "./src/retriever.js";
 import { createScopeManager } from "./src/scopes.js";
 import { createMigrator } from "./src/migrate.js";
 import { registerAllMemoryTools } from "./src/tools.js";
-import { ensureSelfImprovementLearningFiles } from "./src/self-improvement-files.js";
+import { appendSelfImprovementEntry, ensureSelfImprovementLearningFiles } from "./src/self-improvement-files.js";
 import type { MdMirrorWriter } from "./src/tools.js";
 import { shouldSkipRetrieval } from "./src/adaptive-retrieval.js";
 import { AccessTracker } from "./src/access-tracker.js";
 import { runWithReflectionTransientRetryOnce } from "./src/reflection-retry.js";
 import { resolveReflectionSessionSearchDirs, stripResetSuffix } from "./src/session-recovery.js";
+import {
+  storeReflectionToLanceDB,
+  loadAgentReflectionSlicesFromEntries,
+  DEFAULT_REFLECTION_DERIVED_MAX_AGE_MS,
+} from "./src/reflection-store.js";
+import {
+  extractReflectionLearningGovernanceCandidates,
+  extractReflectionMappedMemoryItems,
+} from "./src/reflection-slices.js";
+import { createReflectionEventId } from "./src/reflection-event-store.js";
+import { buildReflectionMappedMetadata } from "./src/reflection-mapped-metadata.js";
 import { createMemoryCLI } from "./cli.js";
 
 // ============================================================================
@@ -42,6 +53,7 @@ interface PluginConfig {
     taskQuery?: string;
     taskPassage?: string;
     normalized?: boolean;
+    chunking?: boolean;
   };
   dbPath?: string;
   autoCapture?: boolean;
@@ -86,6 +98,7 @@ interface PluginConfig {
   memoryReflection?: {
     enabled?: boolean;
     storeToLanceDB?: boolean;
+    writeLegacyCombined?: boolean;
     injectMode?: ReflectionInjectMode;
     agentId?: string;
     messageCount?: number;
@@ -152,7 +165,6 @@ After completing tasks, evaluate if any learnings should be captured:
 **Log when:**
 - User corrects you -> .learnings/LEARNINGS.md
 - Command/operation fails -> .learnings/ERRORS.md
-- User wants missing capability -> .learnings/FEATURE_REQUESTS.md
 - You discover your knowledge was wrong -> .learnings/LEARNINGS.md
 - You find a better approach -> .learnings/LEARNINGS.md
 
@@ -173,8 +185,8 @@ const DEFAULT_REFLECTION_DEDUPE_ERROR_SIGNALS = true;
 const DEFAULT_REFLECTION_SESSION_TTL_MS = 30 * 60 * 1000;
 const DEFAULT_REFLECTION_MAX_TRACKED_SESSIONS = 200;
 const DEFAULT_REFLECTION_ERROR_SCAN_MAX_CHARS = 8_000;
-const DEFAULT_REFLECTION_DERIVED_MAX_AGE_MS = 2 * 60 * 60 * 1000;
 const REFLECTION_FALLBACK_MARKER = "(fallback) Reflection generation failed; storing minimal pointer only.";
+const DIAG_BUILD_TAG = "memory-lancedb-pro-diag-20260308-0058";
 
 type ReflectionErrorSignal = {
   at: number;
@@ -258,6 +270,25 @@ function clipDiagnostic(text: string, maxLen = 400): string {
   const oneLine = text.replace(/\s+/g, " ").trim();
   if (oneLine.length <= maxLen) return oneLine;
   return `${oneLine.slice(0, maxLen - 3)}...`;
+}
+
+function withTimeout<T>(promise: Promise<T>, timeoutMs: number, label: string): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => {
+      reject(new Error(`${label} timed out after ${timeoutMs}ms`));
+    }, timeoutMs);
+
+    promise.then(
+      (value) => {
+        clearTimeout(timer);
+        resolve(value);
+      },
+      (err) => {
+        clearTimeout(timer);
+        reject(err);
+      }
+    );
+  });
 }
 
 function tryParseJsonObject(raw: string): Record<string, unknown> | null {
@@ -678,19 +709,11 @@ function buildReflectionPrompt(
     : "- (none)";
   return [
     "You are generating a durable MEMORY REFLECTION entry for an AI assistant system.",
-    "Align with a self-improvement workflow: governance -> distill -> promote.",
     "",
-    "Goal: extract high-signal knowledge and reflection material. Do NOT paste raw transcript.",
-    "Write ONLY Markdown. Be concise but information-dense.",
+    "Output Markdown only. No intro text. No outro text. No extra headings.",
     "",
-    "Hard rules:",
-    "- Do NOT copy long quotes from the conversation.",
-    "- Extract decisions, preferences, lessons, pitfalls, and next actions.",
-    "- If any secret/token/password appears, keep it as [REDACTED] (never reconstruct).",
-    "- If there were tool failures, turn them into actionable learning/error candidates.",
-    "",
-    "Output sections (use these exact headings):",
-    "## Context",
+    "Use these headings exactly once, in this exact order, with exact spelling:",
+    "## Context (session background)",
     "## Decisions (durable)",
     "## User model deltas (about the human)",
     "## Agent model deltas (about the assistant/system)",
@@ -701,25 +724,90 @@ function buildReflectionPrompt(
     "## Invariants",
     "## Derived",
     "",
-    "Guidance for the final two sections (keep them short):",
-    "- Invariants = stable cross-session rules only. Each bullet must read like a rule/policy, not a diary note.",
-    "- Write invariants in executable rule form, such as: Always / Never / When X, do Y / Prefer / Avoid / Require.",
-    "- Do NOT put one-off observations, temporary follow-ups, or vague reflections in Invariants.",
-    "- Derived = latest-run deltas only. Keep only changes exposed by THIS run that should influence the NEXT run.",
-    "- Write derived bullets as concrete next-run adjustments, such as: This run showed ... / Next run ... / Re-check ... / Avoid repeating ...",
-    "- Do NOT restate long-term rules in Derived.",
+    "Hard rules:",
+    "- Do not rename, translate, merge, reorder, or omit headings.",
+    "- Every section must appear exactly once.",
+    "- For bullet sections, use one item per line, starting with '- '.",
+    "- Do not wrap one bullet across multiple lines.",
+    "- If a bullet section is empty, write exactly: '- (none captured)'",
+    "- Do not paste raw transcript.",
+    "- Do not invent Logged timestamps, ids, file paths, commit hashes, session ids, or storage metadata unless they already appear in the input.",
+    "- If secrets/tokens/passwords appear, keep them as [REDACTED].",
     "",
-    "For 'Learning governance candidates', prefer this structure:",
-    "- LRN candidate(s): correction / best_practice / knowledge_gap",
-    "- ERR candidate(s): reproducible failure signature + fix",
-    "- FEAT candidate(s): missing capability request",
-    "- Promotion candidates: AGENTS.md / SOUL.md / TOOLS.md concise rules",
-    "- Skill extraction candidate: name + why reusable + source learning id placeholder",
+    "Section rules:",
+    "- Context / Decisions / User model / Agent model / Open loops / Retrieval tags / Invariants / Derived = bullet lists only.",
+    "- Lessons & pitfalls = bullet list only; each bullet must be one single line in this shape:",
+    "  - Symptom: ... Cause: ... Fix: ... Prevention: ...",
+    "- Invariants = stable cross-session rules only; prefer bullets starting with Always / Never / When / If / Before / After / Prefer / Avoid / Require.",
+    "- Derived = recent-run distilled learnings, adjustments, and follow-up heuristics that may help the next several runs, but should decay over time.",
+    "- Keep Invariants stable and long-lived; keep Derived recent, reusable across near-term runs, and decayable.",
+    "- Do not restate long-term rules in Derived.",
     "",
-    "Recent tool error signals (PostToolUse-style detector):",
+    "Governance section rules:",
+    "- If empty, write exactly:",
+    "  - (none captured)",
+    "- Otherwise, do NOT use bullet lists there.",
+    "- Use one or more entries in exactly this format:",
+    "",
+    "### Entry 1",
+    "**Priority**: low|medium|high|critical",
+    "**Status**: pending|triage|promoted_to_skill|done",
+    "**Area**: frontend|backend|infra|tests|docs|config|<custom area>",
+    "### Summary",
+    "<one concise candidate>",
+    "### Details",
+    "<short supporting details>",
+    "### Suggested Action",
+    "<one concrete next action>",
+    "",
+    "Notes:",
+    "- Keep writer-owned metadata out of the output. The writer generates Logged and IDs.",
+    "- Prefer structured, machine-parseable output over elegant prose.",
+    "",
+    "OUTPUT TEMPLATE (copy this structure exactly):",
+    "## Context (session background)",
+    "- ...",
+    "",
+    "## Decisions (durable)",
+    "- ...",
+    "",
+    "## User model deltas (about the human)",
+    "- ...",
+    "",
+    "## Agent model deltas (about the assistant/system)",
+    "- ...",
+    "",
+    "## Lessons & pitfalls (symptom / cause / fix / prevention)",
+    "- Symptom: ... Cause: ... Fix: ... Prevention: ...",
+    "",
+    "## Learning governance candidates (.learnings / promotion / skill extraction)",
+    "### Entry 1",
+    "**Priority**: medium",
+    "**Status**: pending",
+    "**Area**: config",
+    "### Summary",
+    "...",
+    "### Details",
+    "...",
+    "### Suggested Action",
+    "...",
+    "",
+    "## Open loops / next actions",
+    "- ...",
+    "",
+    "## Retrieval tags / keywords",
+    "- ...",
+    "",
+    "## Invariants",
+    "- Always ...",
+    "",
+    "## Derived",
+    "- This run showed ...",
+    "",
+    "Recent tool error signals:",
     errorHints,
     "",
-    "INPUT (cleaned recent conversation; role-prefixed):",
+    "INPUT:",
     "```",
     clipped,
     "```",
@@ -728,7 +816,7 @@ function buildReflectionPrompt(
 
 function buildReflectionFallbackText(): string {
   return [
-    "## Context",
+    "## Context (session background)",
     `- ${REFLECTION_FALLBACK_MARKER}`,
     "",
     "## Decisions (durable)",
@@ -744,7 +832,16 @@ function buildReflectionFallbackText(): string {
     "- (none captured)",
     "",
     "## Learning governance candidates (.learnings / promotion / skill extraction)",
-    "- ERR candidate: investigate last failed tool execution and log to .learnings/ERRORS.md",
+    "### Entry 1",
+    "**Priority**: medium",
+    "**Status**: triage",
+    "**Area**: config",
+    "### Summary",
+    "Investigate last failed tool execution and decide whether it belongs in .learnings/ERRORS.md.",
+    "### Details",
+    "The reflection pipeline fell back; confirm the failure is reproducible before treating it as a durable error record.",
+    "### Suggested Action",
+    "Reproduce the latest failed tool execution, classify it as triage or error, and then log it with the appropriate tool/file path evidence.",
     "",
     "## Open loops / next actions",
     "- Investigate why embedded reflection generation failed.",
@@ -799,24 +896,29 @@ async function generateReflectionText(params: {
         const runEmbeddedPiAgent = await loadEmbeddedPiRunner();
         const modelRef = resolveAgentPrimaryModelRef(params.cfg, params.agentId);
         const { provider, model } = modelRef ? splitProviderModel(modelRef) : {};
+        const embeddedTimeoutMs = Math.max(params.timeoutMs + 5000, 15000);
 
-        return await runEmbeddedPiAgent({
-          sessionId: `reflection-${Date.now()}`,
-          sessionKey: "temp:memory-reflection",
-          agentId: params.agentId,
-          sessionFile: tempSessionFile,
-          workspaceDir: params.workspaceDir,
-          config: params.cfg,
-          prompt,
-          disableTools: true,
-          disableMessageTool: true,
-          timeoutMs: params.timeoutMs,
-          runId: `memory-reflection-${Date.now()}`,
-          bootstrapContextMode: "lightweight",
-          thinkLevel: params.thinkLevel,
-          provider,
-          model,
-        });
+        return await withTimeout(
+          runEmbeddedPiAgent({
+            sessionId: `reflection-${Date.now()}`,
+            sessionKey: "temp:memory-reflection",
+            agentId: params.agentId,
+            sessionFile: tempSessionFile,
+            workspaceDir: params.workspaceDir,
+            config: params.cfg,
+            prompt,
+            disableTools: true,
+            disableMessageTool: true,
+            timeoutMs: params.timeoutMs,
+            runId: `memory-reflection-${Date.now()}`,
+            bootstrapContextMode: "lightweight",
+            thinkLevel: params.thinkLevel,
+            provider,
+            model,
+          }),
+          embeddedTimeoutMs,
+          "embedded reflection run"
+        );
       },
     });
 
@@ -1226,6 +1328,7 @@ const memoryLanceDBProPlugin = {
       taskQuery: config.embedding.taskQuery,
       taskPassage: config.embedding.taskPassage,
       normalized: config.embedding.normalized,
+      chunking: config.embedding.chunking,
     });
     const retriever = createRetriever(store, embedder, {
       ...DEFAULT_RETRIEVAL_CONFIG,
@@ -1313,198 +1416,17 @@ const memoryLanceDBProPlugin = {
       return clipped;
     };
 
-    const parseSectionBullets = (markdown: string, heading: string): string[] => {
-      const lines = markdown.split(/\r?\n/);
-      const headingNeedle = `## ${heading}`.toLowerCase();
-      let inSection = false;
-      const collected: string[] = [];
-      for (const raw of lines) {
-        const line = raw.trim();
-        const lower = line.toLowerCase();
-        if (lower.startsWith("## ")) {
-          inSection = lower === headingNeedle;
-          continue;
-        }
-        if (!inSection) continue;
-        if (line.startsWith("- ") || line.startsWith("* ")) {
-          const normalized = line.slice(2).trim();
-          if (normalized) collected.push(normalized);
-        }
-      }
-      return collected;
-    };
-
-    const extractReflectionSlices = (reflectionText: string): { invariants: string[]; derived: string[] } => {
-      const isPlaceholderSlice = (line: string): boolean => {
-        const normalized = line.replace(/\*\*/g, "").trim();
-        if (!normalized) return true;
-        if (/^\(none( captured)?\)$/i.test(normalized)) return true;
-        if (/^(invariants?|reflections?|derived)[:：]$/i.test(normalized)) return true;
-        if (/apply this session'?s deltas next run/i.test(normalized)) return true;
-        if (/apply this session'?s distilled changes next run/i.test(normalized)) return true;
-        if (/investigate why embedded reflection generation failed/i.test(normalized)) return true;
-        return false;
-      };
-      const normalizeSliceLine = (line: string): string =>
-        line
-          .replace(/\*\*/g, "")
-          .replace(/^(invariants?|reflections?|derived)[:：]\s*/i, "")
-          .trim();
-      const cleanSliceLines = (lines: string[]): string[] =>
-        lines
-          .map(normalizeSliceLine)
-          .filter((line) => !isPlaceholderSlice(line));
-      const isInvariantRuleLike = (line: string): boolean =>
-        /^(always|never|when\b|if\b|before\b|after\b|prefer\b|avoid\b|require\b|only\b|do not\b|must\b|should\b)/i.test(line) ||
-        /\b(must|should|never|always|prefer|avoid|required?)\b/i.test(line);
-      const isDerivedDeltaLike = (line: string): boolean =>
-        /^(this run|next run|going forward|follow-up|re-check|retest|verify|confirm|avoid repeating|adjust|change|update|retry|keep|watch)\b/i.test(line) ||
-        /\b(this run|next run|delta|change|adjust|retry|re-check|retest|verify|confirm|avoid repeating|follow-up)\b/i.test(line);
-      const isOpenLoopAction = (line: string): boolean =>
-        /^(investigate|verify|confirm|re-check|retest|update|add|remove|fix|avoid|keep|watch|document)\b/i.test(line);
-
-      const invariantSection = parseSectionBullets(reflectionText, "Invariants");
-      const derivedSection = parseSectionBullets(reflectionText, "Derived");
-      const mergedSection = parseSectionBullets(reflectionText, "Invariants & Reflections");
-
-      const invariantsPrimary = cleanSliceLines(invariantSection).filter(isInvariantRuleLike);
-      const derivedPrimary = cleanSliceLines(derivedSection).filter(isDerivedDeltaLike);
-
-      const invariantLinesLegacy = cleanSliceLines(
-        mergedSection.filter((line) => /invariant|stable|policy|rule/i.test(line))
-      ).filter(isInvariantRuleLike);
-      const reflectionLinesLegacy = cleanSliceLines(
-        mergedSection.filter((line) => /reflect|inherit|derive|change|apply/i.test(line))
-      ).filter(isDerivedDeltaLike);
-      const openLoopLines = cleanSliceLines(parseSectionBullets(reflectionText, "Open loops / next actions"))
-        .filter(isOpenLoopAction)
-        .filter(isDerivedDeltaLike);
-      const durableDecisionLines = cleanSliceLines(parseSectionBullets(reflectionText, "Decisions (durable)"))
-        .filter(isInvariantRuleLike);
-
-      const invariants = invariantsPrimary.length > 0
-        ? invariantsPrimary
-        : (invariantLinesLegacy.length > 0 ? invariantLinesLegacy : durableDecisionLines);
-      const derived = derivedPrimary.length > 0
-        ? derivedPrimary
-        : [...reflectionLinesLegacy, ...openLoopLines];
-      return {
-        invariants: invariants.slice(0, 8),
-        derived: derived.slice(0, 10),
-      };
-    };
-
-    const parseMemoryMetadata = (metadataRaw: string | undefined): Record<string, unknown> => {
-      if (!metadataRaw) return {};
-      try {
-        const parsed = JSON.parse(metadataRaw);
-        return parsed && typeof parsed === "object" ? parsed as Record<string, unknown> : {};
-      } catch {
-        return {};
-      }
-    };
-
-    const storeReflectionToLanceDB = async (params: {
-      reflectionText: string;
-      sessionKey: string;
-      sessionId: string;
-      agentId: string;
-      command: string;
-      scope: string;
-      toolErrorSignals: ReflectionErrorSignal[];
-      runAt: number;
-      usedFallback: boolean;
-    }) => {
-      const slices = extractReflectionSlices(params.reflectionText);
-      const dateYmd = new Date(params.runAt).toISOString().split("T")[0];
-      const payload = [
-        `reflection:${params.scope} · ${dateYmd}`,
-        `Session Reflection (${new Date(params.runAt).toISOString()})`,
-        `Session Key: ${params.sessionKey}`,
-        `Session ID: ${params.sessionId}`,
-        "",
-        "Invariants:",
-        ...(slices.invariants.length > 0 ? slices.invariants.map((x) => `- ${x}`) : ["- (none)"]),
-        "",
-        "Derived:",
-        ...(slices.derived.length > 0 ? slices.derived.map((x) => `- ${x}`) : ["- (none)"]),
-        "",
-        "Reflection:",
-        params.reflectionText.trim(),
-      ].join("\n");
-
-      const vector = await embedder.embedPassage(payload);
-      const existing = await store.vectorSearch(vector, 1, 0.1, [params.scope]);
-      if (existing.length > 0 && existing[0].score > 0.97) {
-        return { stored: false, slices };
-      }
-
-      await store.store({
-        text: payload,
-        vector,
-        category: "reflection",
-        scope: params.scope,
-        importance: 0.75,
-        metadata: JSON.stringify({
-          type: "memory-reflection",
-          stage: "reflect-store",
-          sessionKey: params.sessionKey,
-          sessionId: params.sessionId,
-          agentId: params.agentId,
-          command: params.command,
-          storedAt: params.runAt,
-          invariants: slices.invariants,
-          derived: slices.derived,
-          usedFallback: params.usedFallback,
-          errorSignals: params.toolErrorSignals.map((s) => s.signatureHash),
-        }),
-      });
-      return { stored: true, slices };
-    };
-
     const loadAgentReflectionSlices = async (agentId: string, scopeFilter: string[]) => {
       const cacheKey = `${agentId}::${[...scopeFilter].sort().join(",")}`;
       const cached = reflectionByAgentCache.get(cacheKey);
       if (cached && Date.now() - cached.updatedAt < 15_000) return cached;
 
-      const now = Date.now();
       const entries = await store.list(scopeFilter, undefined, 120, 0);
-      const reflections = entries
-        .map((entry) => ({ entry, metadata: parseMemoryMetadata(entry.metadata) }))
-        .filter(({ metadata }) =>
-          metadata.type === "memory-reflection" && (metadata.agentId === agentId || metadata.agentId === "main")
-        )
-        .sort((a, b) => b.entry.timestamp - a.entry.timestamp)
-        .slice(0, 6);
-      const recentReflections = reflections.filter(
-        ({ entry }) => now - entry.timestamp <= DEFAULT_REFLECTION_DERIVED_MAX_AGE_MS
-      );
-
-      const invariants: string[] = [];
-      const derived: string[] = [];
-      for (const { metadata } of recentReflections) {
-        const inv = Array.isArray(metadata.invariants) ? metadata.invariants.map((x) => String(x)) : [];
-        for (const item of inv) {
-          if (item && !invariants.includes(item)) invariants.push(item);
-          if (invariants.length >= 8) break;
-        }
-      }
-
-      // Derived focus should come from the latest recent non-fallback reflection with actual delta lines.
-      const latestForDerived = recentReflections.find(({ metadata }) =>
-        metadata.usedFallback !== true &&
-        Array.isArray(metadata.derived) &&
-        metadata.derived.some((x: unknown) => typeof x === "string" && x.trim().length > 0 && !/^\(none/i.test(x.trim()))
-      );
-      if (latestForDerived) {
-        const der = Array.isArray(latestForDerived.metadata.derived)
-          ? latestForDerived.metadata.derived.map((x) => String(x))
-          : [];
-        for (const item of der) {
-          if (item && !derived.includes(item)) derived.push(item);
-          if (derived.length >= 10) break;
-        }
-      }
+      const { invariants, derived } = loadAgentReflectionSlicesFromEntries({
+        entries,
+        agentId,
+        deriveMaxAgeMs: DEFAULT_REFLECTION_DERIVED_MAX_AGE_MS,
+      });
       const next = { updatedAt: Date.now(), invariants, derived };
       reflectionByAgentCache.set(cacheKey, next);
       return next;
@@ -1520,6 +1442,7 @@ const memoryLanceDBProPlugin = {
     api.logger.info(
       `memory-lancedb-pro@${pluginVersion}: plugin registered (db: ${resolvedDbPath}, model: ${config.embedding.model || "text-embedding-3-small"})`,
     );
+    api.logger.info(`memory-lancedb-pro: diagnostic build tag loaded (${DIAG_BUILD_TAG})`);
 
     // ========================================================================
     // Markdown Mirror
@@ -1823,10 +1746,27 @@ const memoryLanceDBProPlugin = {
       if (config.selfImprovement?.beforeResetNote !== false) {
         const appendSelfImprovementNote = async (event: any) => {
           try {
-            if (!Array.isArray(event.messages)) return;
+            const action = String(event?.action || "unknown");
+            const sessionKeyForLog = typeof event?.sessionKey === "string" ? event.sessionKey : "";
+            const contextForLog = (event?.context && typeof event.context === "object")
+              ? (event.context as Record<string, unknown>)
+              : {};
+            const commandSource = typeof contextForLog.commandSource === "string" ? contextForLog.commandSource : "";
+            const contextKeys = Object.keys(contextForLog).slice(0, 8).join(",");
+            api.logger.info(
+              `self-improvement: command:${action} hook start; sessionKey=${sessionKeyForLog || "(none)"}; source=${commandSource || "(unknown)"}; hasMessages=${Array.isArray(event?.messages)}; contextKeys=${contextKeys || "(none)"}`
+            );
+
+            if (!Array.isArray(event.messages)) {
+              api.logger.warn(`self-improvement: command:${action} missing event.messages array; skip note inject`);
+              return;
+            }
 
             const exists = event.messages.some((m: unknown) => typeof m === "string" && m.includes(SELF_IMPROVEMENT_NOTE_PREFIX));
-            if (exists) return;
+            if (exists) {
+              api.logger.info(`self-improvement: command:${action} note already present; skip duplicate inject`);
+              return;
+            }
 
             event.messages.push(
               [
@@ -1834,12 +1774,13 @@ const memoryLanceDBProPlugin = {
                 "- If anything was learned/corrected, log it now:",
                 "  - .learnings/LEARNINGS.md (corrections/best practices)",
                 "  - .learnings/ERRORS.md (failures/root causes)",
-                "  - .learnings/FEATURE_REQUESTS.md (missing capability)",
                 "- Distill reusable rules to AGENTS.md / SOUL.md / TOOLS.md.",
                 "- If reusable across tasks, extract a new skill from the learning.",
-                "- Reflect -> Store -> Inherit -> Derive -> Apply.",
                 "- Then proceed with the new session.",
               ].join("\n")
+            );
+            api.logger.info(
+              `self-improvement: command:${action} injected note; messages=${event.messages.length}`
             );
           } catch (err) {
             api.logger.warn(`self-improvement: note inject failed: ${String(err)}`);
@@ -1874,6 +1815,7 @@ const memoryLanceDBProPlugin = {
       const reflectionDedupeErrorSignals = config.memoryReflection?.dedupeErrorSignals !== false;
       const reflectionInjectMode = config.memoryReflection?.injectMode ?? "inheritance+derived";
       const reflectionStoreToLanceDB = config.memoryReflection?.storeToLanceDB !== false;
+      const reflectionWriteLegacyCombined = config.memoryReflection?.writeLegacyCombined !== false;
       const warnedInvalidReflectionAgentIds = new Set<string>();
 
       const resolveReflectionRunAgentId = (cfg: unknown, sourceAgentId: string): string => {
@@ -1968,7 +1910,7 @@ const memoryLanceDBProPlugin = {
               blocks.push(
                 [
                   "<derived-focus>",
-                  "Latest derived execution deltas from reflection memory:",
+                  "Weighted recent derived execution deltas from reflection memory:",
                   ...derivedLines.slice(0, 6).map((line, i) => `${i + 1}. ${line}`),
                   "</derived-focus>",
                 ].join("\n")
@@ -2010,15 +1952,23 @@ const memoryLanceDBProPlugin = {
         const sessionKey = typeof event.sessionKey === "string" ? event.sessionKey : "";
         try {
           pruneReflectionSessionState();
+          const action = String(event?.action || "unknown");
           const context = (event.context || {}) as Record<string, unknown>;
           const cfg = context.cfg;
           const workspaceDir = resolveWorkspaceDirFromContext(context);
-          if (!cfg) return;
+          if (!cfg) {
+            api.logger.warn(`memory-reflection: command:${action} missing cfg in hook context; skip reflection`);
+            return;
+          }
 
           const sessionEntry = (context.previousSessionEntry || context.sessionEntry || {}) as Record<string, unknown>;
           const currentSessionId = typeof sessionEntry.sessionId === "string" ? sessionEntry.sessionId : "unknown";
           let currentSessionFile = typeof sessionEntry.sessionFile === "string" ? sessionEntry.sessionFile : undefined;
           const sourceAgentId = parseAgentIdFromSessionKey(sessionKey) || "main";
+          const commandSource = typeof context.commandSource === "string" ? context.commandSource : "";
+          api.logger.info(
+            `memory-reflection: command:${action} hook start; sessionKey=${sessionKey || "(none)"}; source=${commandSource || "(unknown)"}; sessionId=${currentSessionId}; sessionFile=${currentSessionFile || "(none)"}`
+          );
 
           if (!currentSessionFile || currentSessionFile.includes(".reset.")) {
             const searchDirs = resolveReflectionSessionSearchDirs({
@@ -2028,19 +1978,42 @@ const memoryLanceDBProPlugin = {
               currentSessionFile,
               sourceAgentId,
             });
+            api.logger.info(
+              `memory-reflection: command:${action} session recovery start for session ${currentSessionId}; initial=${currentSessionFile || "(none)"}; dirs=${searchDirs.join(" | ") || "(none)"}`
+            );
             for (const sessionsDir of searchDirs) {
               const recovered = await findPreviousSessionFile(sessionsDir, currentSessionFile, currentSessionId);
               if (recovered) {
+                api.logger.info(
+                  `memory-reflection: command:${action} recovered session file ${recovered} from ${sessionsDir}`
+                );
                 currentSessionFile = recovered;
                 break;
               }
             }
           }
 
-          if (!currentSessionFile) return;
+          if (!currentSessionFile) {
+            const searchDirs = resolveReflectionSessionSearchDirs({
+              context,
+              cfg,
+              workspaceDir,
+              currentSessionFile,
+              sourceAgentId,
+            });
+            api.logger.warn(
+              `memory-reflection: command:${action} missing session file after recovery for session ${currentSessionId}; dirs=${searchDirs.join(" | ") || "(none)"}`
+            );
+            return;
+          }
 
           const conversation = await readSessionConversationWithResetFallback(currentSessionFile, reflectionMessageCount);
-          if (!conversation) return;
+          if (!conversation) {
+            api.logger.warn(
+              `memory-reflection: command:${action} conversation empty/unusable for session ${currentSessionId}; file=${currentSessionFile}`
+            );
+            return;
+          }
 
           const now = new Date(typeof event.timestamp === "number" ? event.timestamp : Date.now());
           const nowTs = now.getTime();
@@ -2054,6 +2027,9 @@ const memoryLanceDBProPlugin = {
             ? (reflectionErrorStateBySession.get(sessionKey)?.entries ?? []).slice(-reflectionErrorReminderMaxEntries)
             : [];
 
+          api.logger.info(
+            `memory-reflection: command:${action} reflection generation start for session ${currentSessionId}; timeoutMs=${reflectionTimeoutMs}`
+          );
           const reflectionGenerated = await generateReflectionText({
             conversation,
             maxInputChars: reflectionMaxInputChars,
@@ -2065,6 +2041,9 @@ const memoryLanceDBProPlugin = {
             toolErrorSignals,
             logger: api.logger,
           });
+          api.logger.info(
+            `memory-reflection: command:${action} reflection generation done for session ${currentSessionId}; runner=${reflectionGenerated.runner}; usedFallback=${reflectionGenerated.usedFallback ? "yes" : "no"}`
+          );
           const reflectionText = reflectionGenerated.text;
           if (reflectionGenerated.runner === "cli") {
             api.logger.warn(
@@ -2114,7 +2093,79 @@ const memoryLanceDBProPlugin = {
             throw new Error(`Failed to allocate unique reflection file for ${dateStr} ${timeCompact}`);
           }
 
-          if (reflectionStoreToLanceDB && !reflectionGenerated.usedFallback) {
+          const reflectionGovernanceCandidates = extractReflectionLearningGovernanceCandidates(reflectionText);
+          if (config.selfImprovement?.enabled !== false && reflectionGovernanceCandidates.length > 0) {
+            for (const candidate of reflectionGovernanceCandidates) {
+              await appendSelfImprovementEntry({
+                baseDir: workspaceDir,
+                type: "learning",
+                summary: candidate.summary,
+                details: candidate.details,
+                suggestedAction: candidate.suggestedAction,
+                category: "best_practice",
+                area: candidate.area || "config",
+                priority: candidate.priority || "medium",
+                status: candidate.status || "pending",
+                source: `memory-lancedb-pro/reflection:${relPath}`,
+              });
+            }
+          }
+
+          const reflectionEventId = createReflectionEventId({
+            runAt: nowTs,
+            sessionKey,
+            sessionId: currentSessionId || "unknown",
+            agentId: sourceAgentId,
+            command: String(event.action || "unknown"),
+          });
+
+          const mappedReflectionMemories = extractReflectionMappedMemoryItems(reflectionText);
+          for (const mapped of mappedReflectionMemories) {
+            const vector = await embedder.embedPassage(mapped.text);
+            let existing: Awaited<ReturnType<typeof store.vectorSearch>> = [];
+            try {
+              existing = await store.vectorSearch(vector, 1, 0.1, [targetScope]);
+            } catch (err) {
+              api.logger.warn(
+                `memory-reflection: mapped memory duplicate pre-check failed, continue store: ${String(err)}`,
+              );
+            }
+
+            if (existing.length > 0 && existing[0].score > 0.95) {
+              continue;
+            }
+
+            const importance = mapped.category === "decision" ? 0.85 : 0.8;
+            const metadata = JSON.stringify(buildReflectionMappedMetadata({
+              mappedItem: mapped,
+              eventId: reflectionEventId,
+              agentId: sourceAgentId,
+              sessionKey,
+              sessionId: currentSessionId || "unknown",
+              runAt: nowTs,
+              usedFallback: reflectionGenerated.usedFallback,
+              toolErrorSignals,
+              sourceReflectionPath: relPath,
+            }));
+
+            const storedEntry = await store.store({
+              text: mapped.text,
+              vector,
+              importance,
+              category: mapped.category,
+              scope: targetScope,
+              metadata,
+            });
+
+            if (mdMirror) {
+              await mdMirror(
+                { text: mapped.text, category: mapped.category, scope: targetScope, timestamp: storedEntry.timestamp },
+                { source: `reflection:${mapped.heading}`, agentId: sourceAgentId },
+              );
+            }
+          }
+
+          if (reflectionStoreToLanceDB) {
             const stored = await storeReflectionToLanceDB({
               reflectionText,
               sessionKey,
@@ -2125,6 +2176,13 @@ const memoryLanceDBProPlugin = {
               toolErrorSignals,
               runAt: nowTs,
               usedFallback: reflectionGenerated.usedFallback,
+              eventId: reflectionEventId,
+              sourceReflectionPath: relPath,
+              writeLegacyCombined: reflectionWriteLegacyCombined,
+              embedPassage: (text) => embedder.embedPassage(text),
+              vectorSearch: (vector, limit, minScore, scopeFilter) =>
+                store.vectorSearch(vector, limit, minScore, scopeFilter),
+              store: (entry) => store.store(entry),
             });
             if (sessionKey && stored.slices.derived.length > 0) {
               reflectionDerivedBySession.set(sessionKey, {
@@ -2412,6 +2470,10 @@ export function parsePluginConfig(value: unknown): PluginConfig {
         typeof embedding.normalized === "boolean"
           ? embedding.normalized
           : undefined,
+      chunking:
+        typeof embedding.chunking === "boolean"
+          ? embedding.chunking
+          : undefined,
     },
     dbPath: typeof cfg.dbPath === "string" ? cfg.dbPath : undefined,
     autoCapture: cfg.autoCapture !== false,
@@ -2447,6 +2509,7 @@ export function parsePluginConfig(value: unknown): PluginConfig {
       ? {
         enabled: sessionStrategy === "memoryReflection",
         storeToLanceDB: reflectionStoreToLanceDB,
+        writeLegacyCombined: memoryReflectionRaw.writeLegacyCombined !== false,
         injectMode: reflectionInjectMode,
         agentId: asNonEmptyString(memoryReflectionRaw.agentId),
         messageCount: reflectionMessageCount,
@@ -2463,6 +2526,7 @@ export function parsePluginConfig(value: unknown): PluginConfig {
       : {
         enabled: sessionStrategy === "memoryReflection",
         storeToLanceDB: reflectionStoreToLanceDB,
+        writeLegacyCombined: true,
         injectMode: "inheritance+derived",
         agentId: undefined,
         messageCount: reflectionMessageCount,
