@@ -76,7 +76,7 @@
       "exposeRetrievalMetadata": {
         "type": "boolean",
         "default": false,
-        "description": "Include score and sources in details.debug for memory_recall/memory_forget tools. Useful for debugging retrieval quality. Default: false to avoid leaking metadata to LLM context."
+        "description": "Include score and sources in details.debug for memory_recall, memory_forget, and memory_update (candidates path) tools. Useful for debugging retrieval quality. Default: false to avoid leaking metadata to LLM context."
       },
       "sessionStrategy": {
         "type": "string",
