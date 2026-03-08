@@ -66,6 +66,8 @@ function clamp01(value: number, fallback = 0.7): number {
 }
 
 function sanitizeMemoryForSerialization(results: RetrievalResult[]) {
+  // Remove score/sources to avoid leaking retrieval metadata through details.memories
+  // Some clients/hosts display or pass through the details object
   return results.map((r) => ({
     id: r.entry.id,
     text: r.entry.text,
@@ -73,8 +75,6 @@ function sanitizeMemoryForSerialization(results: RetrievalResult[]) {
     rawCategory: r.entry.category,
     scope: r.entry.scope,
     importance: r.entry.importance,
-    score: r.score,
-    sources: r.sources,
   }));
 }
 
