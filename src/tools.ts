@@ -874,6 +874,7 @@ export function registerMemoryUpdateTool(
                     `- [${r.entry.id.slice(0, 8)}] ${r.entry.text.slice(0, 60)}${r.entry.text.length > 60 ? "..." : ""}`,
                 )
                 .join("\n");
+              const { memories, debug } = sanitizeMemoryForSerialization(results, context.exposeRetrievalMetadata);
               return {
                 content: [
                   {
@@ -883,7 +884,8 @@ export function registerMemoryUpdateTool(
                 ],
                 details: {
                   action: "candidates",
-                  candidates: sanitizeMemoryForSerialization(results),
+                  candidates: memories,
+                  ...(debug ? { debug } : {}),
                 },
               };
             }
