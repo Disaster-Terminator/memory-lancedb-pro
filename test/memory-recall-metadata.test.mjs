@@ -107,16 +107,20 @@ describe("memory metadata exposure", () => {
   it("exposes debug metadata without polluting memory_recall text when enabled", async () => {
     const tool = createTool(
       registerMemoryRecallTool,
-      makeContext({ expose: true, results: makeResults(1) }),
+      makeContext({ expose: true, results: makeResults(2) }),
     );
 
     const res = await tool.execute(null, { query: "test" });
 
-    assert.equal(res.details.count, 1);
+    assert.equal(res.details.count, 2);
     assert.ok(Array.isArray(res.details.memories));
     assert.ok(Array.isArray(res.details.debug));
+    assert.equal(res.details.debug.length, res.details.memories.length);
     assert.equal(typeof res.details.debug[0].score, "number");
     assert.ok(res.details.debug[0].sources.vector);
+    assert.ok(res.details.debug[0].sources.bm25);
+    assert.equal(res.details.debug[0].id, res.details.memories[0].id);
+    assert.equal(res.details.debug[1].id, res.details.memories[1].id);
     assert.doesNotMatch(res.content[0].text, /82%|vector|BM25|reranked/);
   });
 
