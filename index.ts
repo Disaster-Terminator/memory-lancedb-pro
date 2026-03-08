@@ -1464,6 +1464,7 @@ const memoryLanceDBProPlugin = {
         agentId: undefined, // Will be determined at runtime from context
         workspaceDir: getDefaultWorkspaceDir(),
         mdMirror,
+        exposeRetrievalMetadata: config.exposeRetrievalMetadata,
       },
       {
         enableManagementTools: config.enableManagementTools,
