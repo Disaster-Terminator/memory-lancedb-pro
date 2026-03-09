@@ -1705,7 +1705,7 @@ const memoryLanceDBProPlugin = {
               return postProcessed.slice(0, topK);
             },
             formatLine: (row) =>
-              `- [${row.entry.category}:${row.entry.scope}] ${sanitizeForContext(row.entry.text)} (${(row.score * 100).toFixed(0)}%${row.sources?.bm25 ? ", vector+BM25" : ""}${row.sources?.reranked ? "+reranked" : ""})`,
+              `- [${row.entry.category}:${row.entry.scope}] ${sanitizeForContext(row.entry.text)}`,
           });
         } catch (err) {
           api.logger.warn(`memory-lancedb-pro: auto-recall failed: ${String(err)}`);
