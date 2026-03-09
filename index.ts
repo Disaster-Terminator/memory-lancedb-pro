@@ -50,6 +50,7 @@ import {
   keepMostRecentPerNormalizedKey,
 } from "./src/recall-engine.js";
 import { rankDynamicReflectionRecallFromEntries } from "./src/reflection-recall.js";
+import { selectFinalAutoRecallResults } from "./src/auto-recall-final-selection.js";
 
 // ============================================================================
 // Configuration & Types
@@ -58,7 +59,7 @@ import { rankDynamicReflectionRecallFromEntries } from "./src/reflection-recall.
 interface PluginConfig {
   embedding: {
     provider: "openai-compatible";
-    apiKey: string;
+    apiKey?: string;
     model?: string;
     baseURL?: string;
     dimensions?: number;
@@ -73,6 +74,7 @@ interface PluginConfig {
   autoRecallMinLength?: number;
   autoRecallMinRepeated?: number;
   autoRecallTopK?: number;
+  autoRecallSelectionMode?: AutoRecallSelectionMode;
   autoRecallCategories?: MemoryCategory[];
   autoRecallExcludeReflection?: boolean;
   autoRecallMaxAgeDays?: number;
@@ -88,7 +90,7 @@ interface PluginConfig {
     rerankApiKey?: string;
     rerankModel?: string;
     rerankEndpoint?: string;
-    rerankProvider?: "jina" | "siliconflow" | "voyage" | "pinecone";
+    rerankProvider?: "jina" | "siliconflow" | "voyage" | "pinecone" | "vllm";
     recencyHalfLifeDays?: number;
     recencyWeight?: number;
     filterNoise?: boolean;
@@ -142,6 +144,7 @@ type SessionStrategy = "memoryReflection" | "systemSessionMemory" | "none";
 type ReflectionInjectMode = "inheritance-only" | "inheritance+derived";
 type ReflectionRecallMode = "fixed" | "dynamic";
 type ReflectionRecallKind = "invariant" | "derived";
+type AutoRecallSelectionMode = "mmr" | "setwise-v2";
 type MemoryCategory = "preference" | "fact" | "decision" | "entity" | "other" | "reflection";
 
 // ============================================================================
@@ -259,6 +262,7 @@ const DEFAULT_REFLECTION_SESSION_TTL_MS = 30 * 60 * 1000;
 const DEFAULT_REFLECTION_MAX_TRACKED_SESSIONS = 200;
 const DEFAULT_REFLECTION_ERROR_SCAN_MAX_CHARS = 8_000;
 const DEFAULT_AUTO_RECALL_TOP_K = 3;
+const DEFAULT_AUTO_RECALL_SELECTION_MODE: AutoRecallSelectionMode = "mmr";
 const DEFAULT_AUTO_RECALL_EXCLUDE_REFLECTION = true;
 const DEFAULT_AUTO_RECALL_MAX_AGE_DAYS = 30;
 const DEFAULT_AUTO_RECALL_MAX_ENTRIES_PER_KEY = 10;
@@ -1694,7 +1698,11 @@ const memoryLanceDBProPlugin = {
                 scopeFilter: accessibleScopes,
                 source: "auto-recall",
               });
-              return postProcessAutoRecallResults(retrieved).slice(0, topK);
+              const postProcessed = postProcessAutoRecallResults(retrieved);
+              if (config.autoRecallSelectionMode === "setwise-v2") {
+                return selectFinalAutoRecallResults(postProcessed, { topK });
+              }
+              return postProcessed.slice(0, topK);
             },
             formatLine: (row) =>
               `- [${row.entry.category}:${row.entry.scope}] ${sanitizeForContext(row.entry.text)} (${(row.score * 100).toFixed(0)}%${row.sources?.bm25 ? ", vector+BM25" : ""}${row.sources?.reranked ? "+reranked" : ""})`,
@@ -2088,82 +2096,90 @@ const memoryLanceDBProPlugin = {
         }
       }, { priority: 15 });
 
-      api.on("before_agent_start", async (event, ctx) => {
-        const sessionKey = typeof ctx.sessionKey === "string" ? ctx.sessionKey : "";
-        if (isInternalReflectionSessionKey(sessionKey)) return;
-        if (reflectionInjectMode !== "inheritance-only" && reflectionInjectMode !== "inheritance+derived") return;
-        try {
-          pruneReflectionSessionState();
-          const agentId = typeof ctx.agentId === "string" && ctx.agentId.trim() ? ctx.agentId.trim() : "main";
-          const scopes = scopeManager.getAccessibleScopes(agentId);
-          if (reflectionRecallMode === "fixed") {
-            const slices = await loadAgentReflectionSlices(agentId, scopes);
-            if (slices.invariants.length === 0) return;
-            const body = slices.invariants.slice(0, 6).map((line, i) => `${i + 1}. ${line}`).join("\n");
-            return {
-              prependContext: [
-                "<inherited-rules>",
-                "Stable rules inherited from memory-lancedb-pro reflections. Treat as long-term behavioral constraints unless user overrides.",
-                body,
-                "</inherited-rules>",
-              ].join("\n"),
-            };
-          }
-
-          const sessionId = ctx?.sessionId || "default";
-          const topK = Math.max(1, reflectionRecallTopK);
-          const listLimit = Math.min(800, Math.max(topK * 40, 240));
-          const result = await orchestrateDynamicRecall({
-            channelName: "reflection-recall",
-            prompt: event.prompt,
-            minPromptLength: reflectionRecallMinPromptLength,
-            minRepeated: reflectionRecallMinRepeated,
-            topK,
-            sessionId,
-            state: reflectionDynamicRecallState,
-            outputTag: "inherited-rules",
-            headerLines: [
-              "Dynamic rules selected by Reflection-Recall. Treat as long-term behavioral constraints unless user overrides.",
-            ],
-            logger: api.logger,
-            loadCandidates: async () => {
-              const entries = await store.list(scopes, "reflection", listLimit, 0);
-              return rankDynamicReflectionRecallFromEntries(entries, {
-                agentId,
-                includeKinds: reflectionRecallIncludeKinds,
-                topK,
-                maxAgeMs: daysToMs(reflectionRecallMaxAgeDays),
-                maxEntriesPerKey: reflectionRecallMaxEntriesPerKey,
-                minScore: reflectionRecallMinScore,
-              });
-            },
-            formatLine: (row, index) =>
-              `${index + 1}. ${sanitizeForContext(row.text)} (${(row.score * 100).toFixed(0)}%)`,
-          });
-          if (!result) return;
-          return { prependContext: result.prependContext };
-        } catch (err) {
-          api.logger.warn(`memory-reflection: reflection-recall injection failed: ${String(err)}`);
+      const buildReflectionRecallPrependContext = async (
+        event: { prompt?: string } | undefined,
+        ctx: { sessionId?: string; sessionKey?: string; agentId?: string },
+      ): Promise<string | undefined> => {
+        const agentId = typeof ctx.agentId === "string" && ctx.agentId.trim() ? ctx.agentId.trim() : "main";
+        const scopes = scopeManager.getAccessibleScopes(agentId);
+        if (reflectionRecallMode === "fixed") {
+          const slices = await loadAgentReflectionSlices(agentId, scopes);
+          if (slices.invariants.length === 0) return undefined;
+          const body = slices.invariants.slice(0, 6).map((line, i) => `${i + 1}. ${line}`).join("\n");
+          return [
+            "<inherited-rules>",
+            "Stable rules inherited from memory-lancedb-pro reflections. Treat as long-term behavioral constraints unless user overrides.",
+            body,
+            "</inherited-rules>",
+          ].join("\n");
         }
-      }, { priority: 12 });
 
-      api.on("before_prompt_build", async (_event, ctx) => {
+        const sessionId = ctx?.sessionId || ctx?.sessionKey || "default";
+        const topK = Math.max(1, reflectionRecallTopK);
+        const listLimit = Math.min(800, Math.max(topK * 40, 240));
+        const result = await orchestrateDynamicRecall({
+          channelName: "reflection-recall",
+          prompt: event?.prompt,
+          minPromptLength: reflectionRecallMinPromptLength,
+          minRepeated: reflectionRecallMinRepeated,
+          topK,
+          sessionId,
+          state: reflectionDynamicRecallState,
+          outputTag: "inherited-rules",
+          headerLines: [
+            "Dynamic rules selected by Reflection-Recall. Treat as long-term behavioral constraints unless user overrides.",
+          ],
+          logger: api.logger,
+          loadCandidates: async () => {
+            const entries = await store.list(scopes, "reflection", listLimit, 0);
+            return rankDynamicReflectionRecallFromEntries(entries, {
+              agentId,
+              includeKinds: reflectionRecallIncludeKinds,
+              topK,
+              maxAgeMs: daysToMs(reflectionRecallMaxAgeDays),
+              maxEntriesPerKey: reflectionRecallMaxEntriesPerKey,
+              minScore: reflectionRecallMinScore,
+            });
+          },
+          formatLine: (row, index) =>
+            `${index + 1}. ${sanitizeForContext(row.text)} (${(row.score * 100).toFixed(0)}%)`,
+        });
+        return result?.prependContext;
+      };
+
+      api.on("before_prompt_build", async (event, ctx) => {
         const sessionKey = typeof ctx.sessionKey === "string" ? ctx.sessionKey : "";
         if (isInternalReflectionSessionKey(sessionKey)) return;
         pruneReflectionSessionState();
 
-        if (!sessionKey) return;
-        const pending = getPendingReflectionErrorSignalsForPrompt(sessionKey, reflectionErrorReminderMaxEntries);
-        if (pending.length === 0) return;
-        return {
-          prependContext: [
-            "<error-detected>",
-            "A tool error was detected. Consider logging this to `.learnings/ERRORS.md` if it is non-trivial or likely to recur.",
-            "Recent error signals:",
-            ...pending.map((e, i) => `${i + 1}. [${e.toolName}] ${e.summary}`),
-            "</error-detected>",
-          ].join("\n"),
-        };
+        const contextBlocks: string[] = [];
+
+        if (reflectionInjectMode === "inheritance-only" || reflectionInjectMode === "inheritance+derived") {
+          try {
+            const inheritedRules = await buildReflectionRecallPrependContext(event, ctx);
+            if (inheritedRules) {
+              contextBlocks.push(inheritedRules);
+            }
+          } catch (err) {
+            api.logger.warn(`memory-reflection: reflection-recall injection failed: ${String(err)}`);
+          }
+        }
+
+        if (sessionKey) {
+          const pending = getPendingReflectionErrorSignalsForPrompt(sessionKey, reflectionErrorReminderMaxEntries);
+          if (pending.length > 0) {
+            contextBlocks.push([
+              "<error-detected>",
+              "A tool error was detected. Consider logging this to `.learnings/ERRORS.md` if it is non-trivial or likely to recur.",
+              "Recent error signals:",
+              ...pending.map((e, i) => `${i + 1}. [${e.toolName}] ${e.summary}`),
+              "</error-detected>",
+            ].join("\n"));
+          }
+        }
+
+        if (contextBlocks.length === 0) return;
+        return { prependContext: contextBlocks.join("\n\n") };
       }, { priority: 15 });
 
       api.on("session_end", (_event, ctx) => {
@@ -2508,7 +2524,7 @@ const memoryLanceDBProPlugin = {
           api.logger.warn(`memory-reflection: before_reset fallback failed: ${String(err)}`);
         }
       }, { priority: 12 });
-      api.logger.info("memory-reflection: integrated hooks registered (command:new, command:reset, after_tool_call, before_agent_start, before_prompt_build)");
+      api.logger.info("memory-reflection: integrated hooks registered (command:new, command:reset, after_tool_call, before_prompt_build[inherited-rules,error-detected])");
     }
 
     if (config.sessionStrategy === "systemSessionMemory") {
@@ -2696,11 +2712,18 @@ export function parsePluginConfig(value: unknown): PluginConfig {
     // apiKey is present but wrong type — throw, don't silently fall back
     throw new Error("embedding.apiKey must be a string or non-empty array of strings");
   } else {
-    apiKey = process.env.OPENAI_API_KEY || "";
-  }
-
-  if (!apiKey || (Array.isArray(apiKey) && apiKey.length === 0)) {
-    throw new Error("embedding.apiKey is required (set directly or via OPENAI_API_KEY env var)");
+    // No apiKey configured — try env var, then fall back to dummy key for local providers (e.g. Ollama)
+    const envKey = process.env.OPENAI_API_KEY;
+    if (envKey) {
+      apiKey = envKey;
+    } else {
+      apiKey = "no-key-required";
+      console.warn(
+        "[memory-lancedb-pro] No embedding.apiKey configured and OPENAI_API_KEY env var not set. " +
+        "This is fine for local providers (Ollama), but cloud providers (Jina, OpenAI) will fail at runtime. " +
+        "Set embedding.apiKey in plugin config or export OPENAI_API_KEY to fix.",
+      );
+    }
   }
 
   const memoryReflectionRaw = typeof cfg.memoryReflection === "object" && cfg.memoryReflection !== null
@@ -2745,6 +2768,12 @@ export function parsePluginConfig(value: unknown): PluginConfig {
   const reflectionRecallMinRepeated = parsePositiveInt(memoryReflectionRecallRaw?.minRepeated) ?? DEFAULT_REFLECTION_RECALL_MIN_REPEATED;
   const reflectionRecallMinScore = parseNonNegativeNumber(memoryReflectionRecallRaw?.minScore) ?? DEFAULT_REFLECTION_RECALL_MIN_SCORE;
   const reflectionRecallMinPromptLength = parsePositiveInt(memoryReflectionRecallRaw?.minPromptLength) ?? DEFAULT_REFLECTION_RECALL_MIN_PROMPT_LENGTH;
+  const autoRecallSelectionMode: AutoRecallSelectionMode =
+    cfg.autoRecallSelectionMode === "setwise-v2"
+      ? "setwise-v2"
+      : cfg.autoRecallSelectionMode === "mmr" || cfg.autoRecallSelectionMode === "legacy"
+        ? "mmr"
+      : DEFAULT_AUTO_RECALL_SELECTION_MODE;
 
   return {
     embedding: {
@@ -2785,6 +2814,7 @@ export function parsePluginConfig(value: unknown): PluginConfig {
     autoRecallMinLength: parsePositiveInt(cfg.autoRecallMinLength),
     autoRecallMinRepeated: parsePositiveInt(cfg.autoRecallMinRepeated),
     autoRecallTopK: parsePositiveInt(cfg.autoRecallTopK) ?? DEFAULT_AUTO_RECALL_TOP_K,
+    autoRecallSelectionMode,
     autoRecallCategories: parseMemoryCategories(cfg.autoRecallCategories, DEFAULT_AUTO_RECALL_CATEGORIES),
     autoRecallExcludeReflection: typeof cfg.autoRecallExcludeReflection === "boolean"
       ? cfg.autoRecallExcludeReflection
