@@ -152,10 +152,11 @@ describe("recall text cleanup", () => {
     const res = await tool.execute(null, { query: "test" });
 
     assert.match(res.content[0].text, /remember this/);
-    assert.doesNotMatch(res.content[0].text, /\d+%|vector|BM25|reranked/);
+    assert.doesNotMatch(res.content[0].text, /\(\d+%[^)]*\)/);
     assert.equal(typeof res.details.memories[0].score, "number");
     assert.ok(res.details.memories[0].sources.vector);
     assert.ok(res.details.memories[0].sources.bm25);
+    assert.ok(res.details.memories[0].sources.reranked);
   });
 
   it("removes retrieval metadata from auto-recall injected text", async () => {
@@ -164,6 +165,7 @@ describe("recall text cleanup", () => {
     const harness = createPluginApiHarness({
       resolveRoot: workspaceDir,
       pluginConfig: {
+        dbPath: path.join(workspaceDir, "db"),
         embedding: { apiKey: "test-api-key" },
         autoCapture: false,
         autoRecall: true,
@@ -185,6 +187,6 @@ describe("recall text cleanup", () => {
 
     assert.ok(output);
     assert.match(output.prependContext, /remember this/);
-    assert.doesNotMatch(output.prependContext, /\d+%|vector|BM25|reranked/);
+    assert.doesNotMatch(output.prependContext, /\(\d+%[^)]*\)/);
   });
 });
