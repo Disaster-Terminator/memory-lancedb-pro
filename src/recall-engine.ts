@@ -125,6 +125,14 @@ export async function orchestrateDynamicRecall<T extends DynamicRecallCandidate>
   params.logger?.info?.(
     `memory-lancedb-pro: ${params.channelName} injecting ${memoryLines.length} row(s) for session=${sessionId}`
   );
+  params.logger?.debug?.(
+    `memory-lancedb-pro: ${params.channelName} selected ${JSON.stringify(
+      injected.map((candidate) => ({
+        id: candidate.id,
+        score: candidate.score,
+      }))
+    )}`
+  );
 
   return {
     prependContext: buildTaggedRecallBlock({

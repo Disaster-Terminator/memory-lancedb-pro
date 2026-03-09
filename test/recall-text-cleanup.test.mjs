@@ -27,12 +27,14 @@ function makeApiCapture() {
     registerTool(cb) {
       capturedCreator = cb;
     },
-    on(event, handler) {
-      events.set(event, handler);
+    on(event, handler, _meta) {
+      const list = events.get(event) || [];
+      list.push(handler);
+      events.set(event, list);
     },
     logger: { info: () => {}, warn: () => {}, debug: () => {} },
   };
-  return { api, getCreator: () => capturedCreator, getEvent: (name) => events.get(name) };
+  return { api, getCreator: () => capturedCreator, getEvent: (name) => events.get(name) || [] };
 }
 
 function createPluginApiHarness({ pluginConfig, resolveRoot }) {
