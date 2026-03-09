@@ -125,13 +125,16 @@ export async function orchestrateDynamicRecall<T extends DynamicRecallCandidate>
   params.logger?.info?.(
     `memory-lancedb-pro: ${params.channelName} injecting ${memoryLines.length} row(s) for session=${sessionId}`
   );
+  const injectedScores = injected
+    .map((candidate) => candidate.score)
+    .filter((score) => Number.isFinite(score));
+  const minScore = injectedScores.length > 0 ? Math.min(...injectedScores) : undefined;
+  const maxScore = injectedScores.length > 0 ? Math.max(...injectedScores) : undefined;
+  const avgScore = injectedScores.length > 0
+    ? injectedScores.reduce((sum, score) => sum + score, 0) / injectedScores.length
+    : undefined;
   params.logger?.debug?.(
-    `memory-lancedb-pro: ${params.channelName} selected ${JSON.stringify(
-      injected.map((candidate) => ({
-        id: candidate.id,
-        score: candidate.score,
-      }))
-    )}`
+    `memory-lancedb-pro: ${params.channelName} selected=${injected.length} injected=${memoryLines.length} scoreStats=${JSON.stringify({ min: minScore, max: maxScore, avg: avgScore })}`
   );
 
   return {
