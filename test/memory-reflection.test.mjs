@@ -2264,6 +2264,21 @@ describe("memory reflection", () => {
       assert.match(followUp.prependContext, /Dynamic reflection rule 1/);
     });
 
+    it("removes retrieval metadata from reflection-recall injected text", async () => {
+      const beforePromptHooks = harness.eventHandlers.get("before_prompt_build") || [];
+      assert.equal(beforePromptHooks.length, 1);
+
+      const inherited = await beforePromptHooks[0].handler(
+        { prompt: "Summarize the standing rules I should keep in mind for this task." },
+        { sessionId: "s-reflection-clean", sessionKey: "agent:main:session:s-reflection-clean", agentId: "main" }
+      );
+
+      assert.ok(inherited);
+      assert.match(inherited.prependContext, /<inherited-rules>/);
+      assert.match(inherited.prependContext, /Dynamic reflection rule 1/);
+      assert.doesNotMatch(inherited.prependContext, /\(\d+%[^)]*\)/);
+    });
+
     it("uses the shared skip gate to suppress both auto-recall and reflection recall on control prompts", async () => {
       const beforeAgentStartHooks = harness.eventHandlers.get("before_agent_start") || [];
       const beforePromptHooks = harness.eventHandlers.get("before_prompt_build") || [];
