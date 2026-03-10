@@ -110,6 +110,14 @@ function makeRecallContext(results = makeResults()) {
       async retrieve() {
         return results;
       },
+      async retrieveWithTrace() {
+        return {
+          results,
+          trace: {
+            stages: [],
+          },
+        };
+      },
       getConfig() {
         return { mode: "hybrid" };
       },
