@@ -96,6 +96,26 @@ function makeResults() {
   ];
 }
 
+function makeExpandedResults() {
+  return [
+    ...makeResults(),
+    {
+      entry: {
+        id: "m3",
+        text: "third item stays clean",
+        category: "note",
+        scope: "project",
+        importance: 0.5,
+        timestamp: Date.now(),
+      },
+      score: 0.65,
+      sources: {
+        vector: { score: 0.65, rank: 3 },
+      },
+    },
+  ];
+}
+
 function makeRecallContext(results = makeResults()) {
   return {
     retriever: {
@@ -169,14 +189,15 @@ describe("recall text cleanup", () => {
   });
 
   it("removes retrieval metadata from every rendered memory_recall line", async () => {
-    const tool = createTool(registerMemoryRecallTool, makeRecallContext());
+    const tool = createTool(registerMemoryRecallTool, makeRecallContext(makeExpandedResults()));
     const res = await tool.execute(null, { query: "test with multiple memories" });
 
     const lines = extractRenderedMemoryRecallLines(res.content[0].text);
 
-    assert.ok(lines.length >= 2, "expected multiple rendered memory lines");
+    assert.equal(lines.length, 3, "expected three rendered memory lines");
+    assert.match(lines[2], /third item stays clean/);
     for (const line of lines) {
-      assert.doesNotMatch(line, /\(\d+%[^)]*\)/);
+      assert.doesNotMatch(line, /\d+%/);
     }
   });
 
