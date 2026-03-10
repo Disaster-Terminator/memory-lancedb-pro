@@ -134,8 +134,12 @@ export async function orchestrateDynamicRecall<T extends DynamicRecallCandidate>
     const injectedScores = formattedInjected
       .map((entry) => entry.candidate.score)
       .filter((score) => Number.isFinite(score));
-    const minScore = injectedScores.length > 0 ? Math.min(...injectedScores) : undefined;
-    const maxScore = injectedScores.length > 0 ? Math.max(...injectedScores) : undefined;
+    const minScore = injectedScores.length > 0
+      ? parseFloat(Math.min(...injectedScores).toFixed(4))
+      : undefined;
+    const maxScore = injectedScores.length > 0
+      ? parseFloat(Math.max(...injectedScores).toFixed(4))
+      : undefined;
     const avgScore = injectedScores.length > 0
       ? parseFloat(
         (injectedScores.reduce((sum, score) => sum + score, 0) / injectedScores.length).toFixed(4)

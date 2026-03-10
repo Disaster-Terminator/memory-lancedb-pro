@@ -1817,6 +1817,40 @@ describe("memory reflection", () => {
       assert.match(debugLog.message, /"avg":0.75/);
     });
 
+    it("rounds min max and avg score stats for readable debug logs", async () => {
+      const state = createDynamicRecallSessionState({ maxSessions: 16 });
+      const logs = [];
+      await orchestrateDynamicRecall({
+        channelName: "unit-dynamic-recall",
+        prompt: "Need targeted recall",
+        minPromptLength: 1,
+        minRepeated: 0,
+        topK: 3,
+        sessionId: "session-rounded-debug",
+        state,
+        outputTag: "relevant-memories",
+        headerLines: [],
+        logger: {
+          info() {},
+          debug(message) {
+            logs.push(String(message));
+          },
+        },
+        loadCandidates: async () => [
+          { id: "rule-a", text: "First survives", score: 0.8200000000000001 },
+          { id: "rule-b", text: "Second survives", score: 0.9100000000000001 },
+        ],
+        formatLine: (candidate) => candidate.text,
+      });
+
+      const debugLog = logs.find((message) => message.includes("scoreStats="));
+      assert.ok(debugLog);
+      assert.match(debugLog, /"min":0.82/);
+      assert.match(debugLog, /"max":0.91/);
+      assert.match(debugLog, /"avg":0.865/);
+      assert.doesNotMatch(debugLog, /0\.8200000000000001|0\.9100000000000001|0\.8650000000000001/);
+    });
+
     it("clears per-session state so repeated-injection guard resets after session_end cleanup", async () => {
       const state = createDynamicRecallSessionState({ maxSessions: 16 });
       const run = () => orchestrateDynamicRecall({
