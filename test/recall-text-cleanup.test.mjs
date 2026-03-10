@@ -78,6 +78,21 @@ function makeResults() {
         reranked: { score: 0.91 },
       },
     },
+    {
+      entry: {
+        id: "m2",
+        text: "prefer concise diffs",
+        category: "preference",
+        scope: "global",
+        importance: 0.8,
+        timestamp: Date.now(),
+      },
+      score: 0.77,
+      sources: {
+        vector: { score: 0.77, rank: 2 },
+        bm25: { score: 0.71, rank: 3 },
+      },
+    },
   ];
 }
 
@@ -133,11 +148,27 @@ describe("recall text cleanup", () => {
     const res = await tool.execute(null, { query: "test" });
 
     assert.match(res.content[0].text, /remember this/);
+    assert.match(res.content[0].text, /prefer concise diffs/);
     assert.doesNotMatch(res.content[0].text, /\(\d+%[^)]*\)/);
     assert.equal(typeof res.details.memories[0].score, "number");
     assert.ok(res.details.memories[0].sources.vector);
     assert.ok(res.details.memories[0].sources.bm25);
     assert.ok(res.details.memories[0].sources.reranked);
+  });
+
+  it("removes retrieval metadata from every rendered memory_recall line", async () => {
+    const tool = createTool(registerMemoryRecallTool, makeRecallContext());
+    const res = await tool.execute(null, { query: "test with multiple memories" });
+
+    const lines = res.content[0].text
+      .split(/\r?\n/)
+      .map((line) => line.trim())
+      .filter((line) => /^\d+\.\s\[/.test(line));
+
+    assert.ok(lines.length >= 2, "expected multiple rendered memory lines");
+    for (const line of lines) {
+      assert.doesNotMatch(line, /\(\d+%[^)]*\)/);
+    }
   });
 
   it("removes retrieval metadata from auto-recall injected text", async () => {
@@ -148,6 +179,7 @@ describe("recall text cleanup", () => {
       pluginConfig: {
         dbPath: path.join(workspaceDir, "db"),
         embedding: { apiKey: "test-api-key" },
+        smartExtraction: false,
         autoCapture: false,
         autoRecall: true,
         autoRecallMinLength: 1,
