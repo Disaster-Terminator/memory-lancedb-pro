@@ -190,17 +190,18 @@ describe("recall text cleanup", () => {
     memoryLanceDBProPlugin.register(harness.api);
 
     const hooks = harness.eventHandlers.get("before_agent_start") || [];
-    assert.ok(hooks.length >= 1);
-    const autoRecallHook = hooks.find(({ handler }) => typeof handler === "function");
-    assert.ok(autoRecallHook);
+    assert.equal(hooks.length, 1, "expected exactly one before_agent_start hook for this config");
+    const [{ handler: autoRecallHook }] = hooks;
+    assert.equal(typeof autoRecallHook, "function");
 
-    const output = await autoRecallHook.handler(
+    const output = await autoRecallHook(
       { prompt: "Please recall what I mentioned before about this task." },
       { sessionId: "auto-clean", sessionKey: "agent:main:session:auto-clean", agentId: "main" }
     );
 
     assert.ok(output);
     assert.match(output.prependContext, /remember this/);
+    assert.match(output.prependContext, /prefer concise diffs/);
     assert.doesNotMatch(output.prependContext, /\(\d+%[^)]*\)/);
   });
 });
