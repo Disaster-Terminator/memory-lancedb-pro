@@ -129,6 +129,13 @@ function createTool(registerTool, context) {
   return creator({});
 }
 
+function extractRenderedMemoryRecallLines(text) {
+  return text
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter((line) => /^\d+\.\s\[/.test(line));
+}
+
 describe("recall text cleanup", () => {
   let workspaceDir;
   let originalRetrieve;
@@ -147,23 +154,25 @@ describe("recall text cleanup", () => {
     const tool = createTool(registerMemoryRecallTool, makeRecallContext());
     const res = await tool.execute(null, { query: "test" });
 
-    assert.match(res.content[0].text, /remember this/);
-    assert.match(res.content[0].text, /prefer concise diffs/);
-    assert.doesNotMatch(res.content[0].text, /\(\d+%[^)]*\)/);
+    assert.deepEqual(extractRenderedMemoryRecallLines(res.content[0].text), [
+      "1. [m1] [fact:global] remember this",
+      "2. [m2] [preference:global] prefer concise diffs",
+    ]);
+
     assert.equal(typeof res.details.memories[0].score, "number");
     assert.ok(res.details.memories[0].sources.vector);
     assert.ok(res.details.memories[0].sources.bm25);
     assert.ok(res.details.memories[0].sources.reranked);
+    assert.equal(typeof res.details.memories[1].score, "number");
+    assert.ok(res.details.memories[1].sources.vector);
+    assert.ok(res.details.memories[1].sources.bm25);
   });
 
   it("removes retrieval metadata from every rendered memory_recall line", async () => {
     const tool = createTool(registerMemoryRecallTool, makeRecallContext());
     const res = await tool.execute(null, { query: "test with multiple memories" });
 
-    const lines = res.content[0].text
-      .split(/\r?\n/)
-      .map((line) => line.trim())
-      .filter((line) => /^\d+\.\s\[/.test(line));
+    const lines = extractRenderedMemoryRecallLines(res.content[0].text);
 
     assert.ok(lines.length >= 2, "expected multiple rendered memory lines");
     for (const line of lines) {
@@ -202,6 +211,7 @@ describe("recall text cleanup", () => {
     assert.ok(output);
     assert.match(output.prependContext, /remember this/);
     assert.match(output.prependContext, /prefer concise diffs/);
-    assert.doesNotMatch(output.prependContext, /\(\d+%[^)]*\)/);
+    assert.doesNotMatch(output.prependContext, /vector\+BM25/);
+    assert.doesNotMatch(output.prependContext, /reranked/);
   });
 });
