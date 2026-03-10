@@ -1770,6 +1770,53 @@ describe("memory reflection", () => {
   });
 
   describe("dynamic recall session state hygiene", () => {
+    it("logs post-filter score stats only for actually injected rows", async () => {
+      const state = createDynamicRecallSessionState({ maxSessions: 16 });
+      const logs = [];
+      const result = await orchestrateDynamicRecall({
+        channelName: "unit-dynamic-recall",
+        prompt: "Need targeted recall",
+        minPromptLength: 1,
+        minRepeated: 0,
+        topK: 3,
+        sessionId: "session-debug",
+        state,
+        outputTag: "relevant-memories",
+        headerLines: [],
+        logger: {
+          info(message) {
+            logs.push({ level: "info", message });
+          },
+          debug(message) {
+            logs.push({ level: "debug", message });
+          },
+        },
+        loadCandidates: async () => [
+          { id: "rule-a", text: "First survives", score: 0.9 },
+          { id: "rule-b", text: "Second filtered", score: 0.3 },
+          { id: "rule-c", text: "Third survives", score: 0.6 },
+        ],
+        formatLine: (candidate) => candidate.id === "rule-b" ? "   " : candidate.text,
+      });
+
+      assert.ok(result);
+      assert.equal(result.injectedCount, 2);
+      assert.match(result.prependContext, /First survives/);
+      assert.match(result.prependContext, /Third survives/);
+      assert.doesNotMatch(result.prependContext, /Second filtered/);
+
+      const infoLog = logs.find((entry) => entry.level === "info");
+      assert.ok(infoLog);
+      assert.match(infoLog.message, /injecting 2 row\(s\)/);
+
+      const debugLog = logs.find((entry) => entry.level === "debug");
+      assert.ok(debugLog);
+      assert.match(debugLog.message, /selected=3 injected=2/);
+      assert.match(debugLog.message, /"min":0.6/);
+      assert.match(debugLog.message, /"max":0.9/);
+      assert.match(debugLog.message, /"avg":0.75/);
+    });
+
     it("clears per-session state so repeated-injection guard resets after session_end cleanup", async () => {
       const state = createDynamicRecallSessionState({ maxSessions: 16 });
       const run = () => orchestrateDynamicRecall({
