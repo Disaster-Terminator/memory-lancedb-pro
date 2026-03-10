@@ -213,5 +213,6 @@ describe("recall text cleanup", () => {
     assert.match(output.prependContext, /prefer concise diffs/);
     assert.doesNotMatch(output.prependContext, /vector\+BM25/);
     assert.doesNotMatch(output.prependContext, /reranked/);
+    assert.doesNotMatch(output.prependContext, /\d+%/);
   });
 });
