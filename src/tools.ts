@@ -11,7 +11,7 @@ import { join } from "node:path";
 import type { MemoryRetriever, RetrievalResult } from "./retriever.js";
 import type { MemoryStore } from "./store.js";
 import { isNoise } from "./noise-filter.js";
-import type { MemoryScopeManager } from "./scopes.js";
+import { resolveScopeFilter, type MemoryScopeManager } from "./scopes.js";
 import type { Embedder } from "./embedder.js";
 import {
   buildSmartMetadata,
@@ -97,7 +97,7 @@ function parseAgentIdFromSessionKey(sessionKey: string | undefined): string | un
 function resolveRuntimeAgentId(
   staticAgentId: string | undefined,
   runtimeCtx: unknown,
-): string | undefined {
+): string {
   if (!runtimeCtx || typeof runtimeCtx !== "object") {
     return staticAgentId || "main";
   }
@@ -116,18 +116,6 @@ function resolveToolContext(
     ...base,
     agentId: resolveRuntimeAgentId(base.agentId, runtimeCtx),
   };
-}
-
-function resolveScopeFilter(
-  scopeManager: Pick<MemoryScopeManager, "getAccessibleScopes"> & {
-    getScopeFilter?: (agentId?: string) => string[] | undefined;
-  },
-  agentId?: string,
-): string[] | undefined {
-  if (typeof scopeManager.getScopeFilter === "function") {
-    return scopeManager.getScopeFilter(agentId);
-  }
-  return scopeManager.getAccessibleScopes(agentId);
 }
 
 async function sleep(ms: number): Promise<void> {

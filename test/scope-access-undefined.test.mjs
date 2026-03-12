@@ -48,6 +48,11 @@ describe("MemoryScopeManager - System & Reflection Scopes", () => {
         "reflection:agent:main",
       ]);
     });
+
+    it("does not bypass the store filter for empty or nullish agentId", () => {
+      assert.deepStrictEqual(manager.getScopeFilter(""), manager.getAllScopes());
+      assert.deepStrictEqual(manager.getScopeFilter(undefined), manager.getAllScopes());
+    });
   });
 
   describe("Reflection scope access for specific agents", () => {
