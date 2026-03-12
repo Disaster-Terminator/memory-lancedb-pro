@@ -9,58 +9,88 @@ describe("MemoryScopeManager - System & Reflection Scopes", () => {
   let manager;
   const config = {
     default: "global",
-    agentAccess: {}
+    agentAccess: {},
   };
 
   beforeEach(() => {
     manager = new MemoryScopeManager(config);
   });
 
-  describe("isBuiltInScope", () => {
-    it("should recognize reflection: prefix as built-in", () => {
-      assert.strictEqual(manager.isBuiltInScope("reflection:agent:main"), true);
-      assert.strictEqual(manager.isBuiltInScope("global"), true);
-    });
-  });
-
-  describe("System/Admin Bypass (agentId identifier)", () => {
+  describe("System/Admin Bypass", () => {
     const bypassIds = ["undefined", "system", "", undefined];
-    
+
     bypassIds.forEach(id => {
-      it(`should allow any valid scope when agentId is '${id}'`, () => {
+      it(`allows valid scopes when agentId is '${id}'`, () => {
         assert.strictEqual(manager.isAccessible("global", id), true);
         assert.strictEqual(manager.isAccessible("reflection:agent:main", id), true);
         assert.strictEqual(manager.isAccessible("agent:any-agent", id), true);
       });
 
-      it(`should return empty accessible scopes for '${id}' to bypass filter`, () => {
-        assert.deepStrictEqual(manager.getAccessibleScopes(id), []);
+      it(`enumerates known scopes when agentId is '${id}'`, () => {
+        assert.deepStrictEqual(manager.getAccessibleScopes(id), manager.getAllScopes());
       });
 
-      it(`should return default config scope when agentId is '${id}'`, () => {
+      it(`returns the default scope when agentId is '${id}'`, () => {
         assert.strictEqual(manager.getDefaultScope(id), "global");
       });
+
+      it(`still rejects invalid scope formats when agentId is '${id}'`, () => {
+        assert.strictEqual(manager.isAccessible("not a valid scope", id), false);
+      });
+    });
+
+    it("uses filter bypass only for reserved internal identifiers", () => {
+      assert.strictEqual(manager.getScopeFilter("system"), undefined);
+      assert.strictEqual(manager.getScopeFilter("undefined"), undefined);
+      assert.deepStrictEqual(manager.getScopeFilter("main"), [
+        "global",
+        "agent:main",
+        "reflection:agent:main",
+      ]);
     });
   });
 
   describe("Reflection scope access for specific agents", () => {
-    it("should allow an agent to access its own reflection scope automatically", () => {
+    it("validates reflection scopes through the public API", () => {
+      assert.strictEqual(manager.validateScope("reflection:agent:main"), true);
+      assert.strictEqual(manager.validateScope("reflection:anything"), true);
+    });
+
+    it("automatically grants default agent and reflection scopes", () => {
+      assert.deepStrictEqual(manager.getAccessibleScopes("main"), [
+        "global",
+        "agent:main",
+        "reflection:agent:main",
+      ]);
+      assert.strictEqual(manager.getDefaultScope("main"), "agent:main");
+    });
+
+    it("allows an agent to access its own reflection scope automatically", () => {
       assert.strictEqual(manager.isAccessible("reflection:agent:main", "main"), true);
       assert.strictEqual(manager.isAccessible("reflection:agent:sub-agent", "sub-agent"), true);
     });
 
-    it("should not allow an agent to access another agent's reflection scope by default", () => {
-      // Note: Current implementation treats reflection: as a general built-in but does it restrict to ID?
-      // Re-checking getAccessibleScopes: it includes reflectionScope = SCOPE_PATTERNS.REFLECTION(agentId)
-      // So reflection:agent:other should NOT be in accessibleScopes for agent "main"
+    it("does not allow an agent to access another agent's reflection scope by default", () => {
       assert.strictEqual(manager.isAccessible("reflection:agent:other", "main"), false);
     });
-  });
 
-  describe("validateScope", () => {
-    it("should validate reflection scope format", () => {
-      assert.strictEqual(manager.validateScope("reflection:agent:main"), true);
-      assert.strictEqual(manager.validateScope("reflection:anything"), true);
+    it("preserves explicit access while still appending the agent's own reflection scope", () => {
+      manager = new MemoryScopeManager({
+        ...config,
+        agentAccess: {
+          main: ["global", "custom:shared"],
+        },
+      });
+
+      assert.deepStrictEqual(manager.getAccessibleScopes("main"), [
+        "global",
+        "custom:shared",
+        "reflection:agent:main",
+      ]);
+      assert.strictEqual(manager.isAccessible("reflection:agent:main", "main"), true);
+      assert.strictEqual(manager.isAccessible("custom:shared", "main"), true);
+      assert.strictEqual(manager.isAccessible("agent:main", "main"), false);
+      assert.strictEqual(manager.getDefaultScope("main"), "global");
     });
   });
 });
