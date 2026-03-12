@@ -98,11 +98,14 @@ function resolveRuntimeAgentId(
   staticAgentId: string | undefined,
   runtimeCtx: unknown,
 ): string | undefined {
-  if (!runtimeCtx || typeof runtimeCtx !== "object") return staticAgentId;
+  if (!runtimeCtx || typeof runtimeCtx !== "object") {
+    return staticAgentId || "main";
+  }
   const ctx = runtimeCtx as Record<string, unknown>;
   const ctxAgentId = typeof ctx.agentId === "string" ? ctx.agentId : undefined;
   const ctxSessionKey = typeof ctx.sessionKey === "string" ? ctx.sessionKey : undefined;
-  return ctxAgentId || parseAgentIdFromSessionKey(ctxSessionKey) || staticAgentId;
+  const resolved = ctxAgentId || parseAgentIdFromSessionKey(ctxSessionKey) || staticAgentId;
+  return resolved && resolved.trim() ? resolved : "main";
 }
 
 function resolveToolContext(
@@ -113,6 +116,18 @@ function resolveToolContext(
     ...base,
     agentId: resolveRuntimeAgentId(base.agentId, runtimeCtx),
   };
+}
+
+function resolveScopeFilter(
+  scopeManager: Pick<MemoryScopeManager, "getAccessibleScopes"> & {
+    getScopeFilter?: (agentId?: string) => string[] | undefined;
+  },
+  agentId?: string,
+): string[] | undefined {
+  if (typeof scopeManager.getScopeFilter === "function") {
+    return scopeManager.getScopeFilter(agentId);
+  }
+  return scopeManager.getAccessibleScopes(agentId);
 }
 
 async function sleep(ms: number): Promise<void> {
@@ -433,7 +448,7 @@ export function registerMemoryRecallTool(
           const agentId = runtimeContext.agentId;
 
           // Determine accessible scopes
-          let scopeFilter = runtimeContext.scopeManager.getAccessibleScopes(agentId);
+          let scopeFilter = resolveScopeFilter(runtimeContext.scopeManager, agentId);
           if (scope) {
             if (runtimeContext.scopeManager.isAccessible(scope, agentId)) {
               scopeFilter = [scope];
@@ -723,7 +738,7 @@ export function registerMemoryForgetTool(
         try {
           const agentId = resolveRuntimeAgentId(context.agentId, runtimeCtx);
           // Determine accessible scopes
-          let scopeFilter = context.scopeManager.getAccessibleScopes(agentId);
+          let scopeFilter = resolveScopeFilter(context.scopeManager, agentId);
           if (scope) {
             if (context.scopeManager.isAccessible(scope, agentId)) {
               scopeFilter = [scope];
@@ -898,7 +913,7 @@ export function registerMemoryUpdateTool(
 
           // Determine accessible scopes
           const agentId = resolveRuntimeAgentId(context.agentId, runtimeCtx);
-          const scopeFilter = context.scopeManager.getAccessibleScopes(agentId);
+          const scopeFilter = resolveScopeFilter(context.scopeManager, agentId);
 
           // Resolve memoryId: if it doesn't look like a UUID, try search
           let resolvedId = memoryId;
@@ -1049,7 +1064,7 @@ export function registerMemoryStatsTool(
         try {
           const agentId = resolveRuntimeAgentId(context.agentId, runtimeCtx);
           // Determine accessible scopes
-          let scopeFilter = context.scopeManager.getAccessibleScopes(agentId);
+          let scopeFilter = resolveScopeFilter(context.scopeManager, agentId);
           if (scope) {
             if (context.scopeManager.isAccessible(scope, agentId)) {
               scopeFilter = [scope];
@@ -1165,7 +1180,7 @@ export function registerMemoryListTool(
           const agentId = resolveRuntimeAgentId(context.agentId, runtimeCtx);
 
           // Determine accessible scopes
-          let scopeFilter = context.scopeManager.getAccessibleScopes(agentId);
+          let scopeFilter = resolveScopeFilter(context.scopeManager, agentId);
           if (scope) {
             if (context.scopeManager.isAccessible(scope, agentId)) {
               scopeFilter = [scope];

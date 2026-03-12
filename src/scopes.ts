@@ -20,6 +20,7 @@ export interface ScopeConfig {
 
 export interface ScopeManager {
   getAccessibleScopes(agentId?: string): string[];
+  getScopeFilter?(agentId?: string): string[] | undefined;
   getDefaultScope(agentId?: string): string;
   isAccessible(scope: string, agentId?: string): boolean;
   validateScope(scope: string): boolean;
@@ -53,6 +54,17 @@ const SCOPE_PATTERNS = {
   PROJECT: (projectId: string) => `project:${projectId}`,
   USER: (userId: string) => `user:${userId}`,
 };
+
+const SYSTEM_BYPASS_IDS = new Set(["system", "undefined"]);
+
+function isSystemBypassId(agentId?: string): boolean {
+  return typeof agentId === "string" && SYSTEM_BYPASS_IDS.has(agentId);
+}
+
+function withOwnReflectionScope(scopes: string[], agentId: string): string[] {
+  const reflectionScope = SCOPE_PATTERNS.REFLECTION(agentId);
+  return scopes.includes(reflectionScope) ? [...scopes] : [...scopes, reflectionScope];
+}
 
 // ============================================================================
 // Scope Manager Implementation
@@ -112,43 +124,34 @@ export class MemoryScopeManager implements ScopeManager {
   }
 
   getAccessibleScopes(agentId?: string): string[] {
-    /**
-     * SECURITY NOTE: "undefined" and "system" are treated as administrative bypass identifiers.
-     * These should only be passed by internal gateway tasks (reflection, compaction).
-     * ENSURE that external API controllers sanitize/intercept these identifiers to prevent
-     * unauthorized privilege escalation from external requests.
-     */
-    if (!agentId || agentId === "undefined" || agentId === "system") {
-      // No agent specified, bypass scope filter for admin/system calls
-      return [];
+    if (isSystemBypassId(agentId) || !agentId) {
+      // Keep enumeration semantics consistent for callers that inspect the list.
+      return this.getAllScopes();
     }
 
-    // Check explicit agent access configuration
+    // Explicit ACLs still inherit the agent's own reflection scope.
     const explicitAccess = this.config.agentAccess[agentId];
     if (explicitAccess) {
-      return explicitAccess;
+      return withOwnReflectionScope(explicitAccess, agentId);
     }
 
-    // Default access: global + agent-specific scope + agent-reflection scope
-    const defaultScopes = ["global"];
-    const agentScope = SCOPE_PATTERNS.AGENT(agentId);
-    const reflectionScope = SCOPE_PATTERNS.REFLECTION(agentId);
+    // Agent and reflection scopes are built-in and provisioned implicitly.
+    return withOwnReflectionScope([
+      "global",
+      SCOPE_PATTERNS.AGENT(agentId),
+    ], agentId);
+  }
 
-    // Only include agent scope if it already exists — don't mutate config as a side effect
-    if (this.config.definitions[agentScope] || this.isBuiltInScope(agentScope)) {
-      defaultScopes.push(agentScope);
+  getScopeFilter(agentId?: string): string[] | undefined {
+    if (isSystemBypassId(agentId)) {
+      // Internal system tasks bypass store-level scope filtering entirely.
+      return undefined;
     }
-
-    // Include reflection scope
-    if (this.config.definitions[reflectionScope] || this.isBuiltInScope(reflectionScope)) {
-      defaultScopes.push(reflectionScope);
-    }
-
-    return defaultScopes;
+    return this.getAccessibleScopes(agentId);
   }
 
   getDefaultScope(agentId?: string): string {
-    if (!agentId || agentId === "undefined" || agentId === "system") {
+    if (!agentId || isSystemBypassId(agentId)) {
       return this.config.default;
     }
 
@@ -164,8 +167,8 @@ export class MemoryScopeManager implements ScopeManager {
   }
 
   isAccessible(scope: string, agentId?: string): boolean {
-    if (!agentId || agentId === "undefined" || agentId === "system") {
-      // No agent specified, allow access to all valid scopes
+    if (!agentId || isSystemBypassId(agentId)) {
+      // No agent specified, or internal bypass identifier: allow any valid scope.
       return this.validateScope(scope);
     }
 
@@ -317,8 +320,8 @@ export class MemoryScopeManager implements ScopeManager {
       } else if (scope.startsWith("project:")) {
         scopesByType.project++;
       } else if (scope.startsWith("user:") || scope.startsWith("reflection:")) {
-        // reflection: scopes are categorized as user/system for stat aggregation 
-        // to prevent dashboard schema errors. Verified safe (not used for billing).
+        // TODO: add a dedicated `reflection` bucket once downstream dashboards accept it.
+        // For now, reflection scopes are counted under `user` for schema compatibility.
         scopesByType.user++;
       } else {
         scopesByType.other++;

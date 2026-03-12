@@ -212,6 +212,19 @@ function resolveHookAgentId(
   return explicitAgentId || parseAgentIdFromSessionKey(sessionKey) || "main";
 }
 
+function resolveScopeFilter(
+  scopeManager: {
+    getAccessibleScopes(agentId?: string): string[];
+    getScopeFilter?: (agentId?: string) => string[] | undefined;
+  },
+  agentId?: string,
+): string[] | undefined {
+  if (typeof scopeManager.getScopeFilter === "function") {
+    return scopeManager.getScopeFilter(agentId);
+  }
+  return scopeManager.getAccessibleScopes(agentId);
+}
+
 function summarizeAgentEndMessages(messages: unknown[]): string {
   const roleCounts = new Map<string, number>();
   let textBlocks = 0;
@@ -2000,7 +2013,7 @@ const memoryLanceDBProPlugin = {
         try {
           // Determine agent ID and accessible scopes
           const agentId = resolveHookAgentId(ctx?.agentId, (event as any).sessionKey);
-          const accessibleScopes = scopeManager.getAccessibleScopes(agentId);
+          const accessibleScopes = resolveScopeFilter(scopeManager, agentId);
 
           const results = await retrieveWithRetry({
             query: event.prompt,
@@ -2092,7 +2105,7 @@ const memoryLanceDBProPlugin = {
         try {
           // Determine agent ID and default scope
           const agentId = resolveHookAgentId(ctx?.agentId, (event as any).sessionKey);
-          const accessibleScopes = scopeManager.getAccessibleScopes(agentId);
+          const accessibleScopes = resolveScopeFilter(scopeManager, agentId);
           const defaultScope = scopeManager.getDefaultScope(agentId);
           const sessionKey = ctx?.sessionKey || (event as any).sessionKey || "unknown";
 
@@ -2524,7 +2537,7 @@ const memoryLanceDBProPlugin = {
         try {
           pruneReflectionSessionState();
           const agentId = typeof ctx.agentId === "string" && ctx.agentId.trim() ? ctx.agentId.trim() : "main";
-          const scopes = scopeManager.getAccessibleScopes(agentId);
+          const scopes = resolveScopeFilter(scopeManager, agentId);
           const slices = await loadAgentReflectionSlices(agentId, scopes);
           if (slices.invariants.length === 0) return;
           const body = slices.invariants.slice(0, 6).map((line, i) => `${i + 1}. ${line}`).join("\n");
@@ -2550,7 +2563,7 @@ const memoryLanceDBProPlugin = {
         const blocks: string[] = [];
         if (reflectionInjectMode === "inheritance+derived") {
           try {
-            const scopes = scopeManager.getAccessibleScopes(agentId);
+            const scopes = resolveScopeFilter(scopeManager, agentId);
             const derivedCache = sessionKey ? reflectionDerivedBySession.get(sessionKey) : null;
             const derivedLines = derivedCache?.derived?.length
               ? derivedCache.derived
