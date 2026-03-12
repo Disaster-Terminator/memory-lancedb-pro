@@ -384,6 +384,18 @@ export function isScopeAccessible(scope: string, allowedScopes: string[]): boole
   return allowedScopes.includes(scope);
 }
 
+export function resolveScopeFilter(
+  scopeManager: Pick<ScopeManager, "getAccessibleScopes"> & {
+    getScopeFilter?: (agentId?: string) => string[] | undefined;
+  },
+  agentId?: string,
+): string[] | undefined {
+  if (typeof scopeManager.getScopeFilter === "function") {
+    return scopeManager.getScopeFilter(agentId);
+  }
+  return scopeManager.getAccessibleScopes(agentId);
+}
+
 export function filterScopesForAgent(scopes: string[], agentId?: string, scopeManager?: ScopeManager): string[] {
   if (!scopeManager || !agentId) {
     return scopes;

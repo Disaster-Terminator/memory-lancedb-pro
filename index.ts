@@ -17,7 +17,7 @@ import { spawn } from "node:child_process";
 import { MemoryStore, validateStoragePath } from "./src/store.js";
 import { createEmbedder, getVectorDimensions } from "./src/embedder.js";
 import { createRetriever, DEFAULT_RETRIEVAL_CONFIG } from "./src/retriever.js";
-import { createScopeManager } from "./src/scopes.js";
+import { createScopeManager, resolveScopeFilter } from "./src/scopes.js";
 import { createMigrator } from "./src/migrate.js";
 import { registerAllMemoryTools } from "./src/tools.js";
 import { appendSelfImprovementEntry, ensureSelfImprovementLearningFiles } from "./src/self-improvement-files.js";
@@ -210,19 +210,6 @@ function resolveHookAgentId(
   sessionKey: string | undefined,
 ): string {
   return explicitAgentId || parseAgentIdFromSessionKey(sessionKey) || "main";
-}
-
-function resolveScopeFilter(
-  scopeManager: {
-    getAccessibleScopes(agentId?: string): string[];
-    getScopeFilter?: (agentId?: string) => string[] | undefined;
-  },
-  agentId?: string,
-): string[] | undefined {
-  if (typeof scopeManager.getScopeFilter === "function") {
-    return scopeManager.getScopeFilter(agentId);
-  }
-  return scopeManager.getAccessibleScopes(agentId);
 }
 
 function summarizeAgentEndMessages(messages: unknown[]): string {
