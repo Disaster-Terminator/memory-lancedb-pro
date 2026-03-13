@@ -544,7 +544,15 @@ async function loadSelfImprovementReminderContent(workspaceDir?: string): Promis
 function parseAgentIdFromSessionKey(sessionKey: string | undefined): string | undefined {
   const sk = (sessionKey ?? "").trim();
   const parts = sk.split(":");
-  if (parts.length >= 2 && parts[0] === "agent" && parts[1]) return parts[1];
+  if (parts.length >= 2 && parts[0] === "agent" && parts[1]) {
+    const candidate = parts[1];
+    // Block reserved bypass IDs ("system", "undefined") from session key extraction.
+    // Prevents agent:undefined:... or agent:system:... from reaching bypass semantics.
+    if (candidate === "system" || candidate === "undefined") {
+      return undefined;
+    }
+    return candidate;
+  }
   return undefined;
 }
 

@@ -157,6 +157,18 @@ export class MemoryScopeManager implements ScopeManager {
     ], agentId);
   }
 
+  /**
+   * Store-layer scope filter semantics:
+   *
+   * | Return value        | Store behavior                          | When                                   |
+   * |---------------------|-----------------------------------------|----------------------------------------|
+   * | `undefined`         | No scope filtering (full bypass)        | Reserved bypass ids (system/undefined) |
+   * | `["global", ...]`   | Restrict reads to listed scopes         | Normal agent with explicit access      |
+   *
+   * IMPORTANT: The store layer currently treats both `undefined` and `[]` as "no restriction"
+   * (because it checks `scopeFilter && scopeFilter.length > 0` before filtering).
+   * Do NOT return `[]` expecting "match nothing" — it means "match everything" in practice.
+   */
   getScopeFilter(agentId?: string): string[] | undefined {
     if (isSystemBypassId(agentId)) {
       // Internal system tasks bypass store-level scope filtering entirely.

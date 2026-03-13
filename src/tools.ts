@@ -91,7 +91,13 @@ function sanitizeMemoryForSerialization(results: RetrievalResult[]) {
 function parseAgentIdFromSessionKey(sessionKey: string | undefined): string | undefined {
   if (!sessionKey) return undefined;
   const m = /^agent:([^:]+):/.exec(sessionKey);
-  return m?.[1];
+  const candidate = m?.[1];
+  // Block reserved bypass IDs ("system", "undefined") from session key extraction.
+  // Prevents agent:undefined:... or agent:system:... from reaching bypass semantics.
+  if (candidate === "system" || candidate === "undefined") {
+    return undefined;
+  }
+  return candidate;
 }
 
 function resolveRuntimeAgentId(
@@ -105,7 +111,8 @@ function resolveRuntimeAgentId(
   const ctxAgentId = typeof ctx.agentId === "string" ? ctx.agentId : undefined;
   const ctxSessionKey = typeof ctx.sessionKey === "string" ? ctx.sessionKey : undefined;
   const resolved = ctxAgentId || parseAgentIdFromSessionKey(ctxSessionKey) || staticAgentId;
-  return resolved && resolved.trim() ? resolved : "main";
+  const trimmed = resolved?.trim();
+  return trimmed ? trimmed : "main";
 }
 
 function resolveToolContext(
