@@ -100,18 +100,34 @@ function parseAgentIdFromSessionKey(sessionKey: string | undefined): string | un
   return candidate;
 }
 
+const _warnedMissingAgentId = new Set<string>();
+
 function resolveRuntimeAgentId(
   staticAgentId: string | undefined,
   runtimeCtx: unknown,
 ): string {
   if (!runtimeCtx || typeof runtimeCtx !== "object") {
-    return staticAgentId || "main";
+    const fallback = staticAgentId || "main";
+    if (!staticAgentId && !_warnedMissingAgentId.has("no-context")) {
+      _warnedMissingAgentId.add("no-context");
+      console.warn(
+        "resolveRuntimeAgentId: no runtime context or static agentId, defaulting to 'main'. " +
+        "Tool callers without explicit agentId will be scoped to agent:main + global only."
+      );
+    }
+    return fallback;
   }
   const ctx = runtimeCtx as Record<string, unknown>;
   const ctxAgentId = typeof ctx.agentId === "string" ? ctx.agentId : undefined;
   const ctxSessionKey = typeof ctx.sessionKey === "string" ? ctx.sessionKey : undefined;
   const resolved = ctxAgentId || parseAgentIdFromSessionKey(ctxSessionKey) || staticAgentId;
   const trimmed = resolved?.trim();
+  if (!trimmed && !_warnedMissingAgentId.has("empty-resolved")) {
+    _warnedMissingAgentId.add("empty-resolved");
+    console.warn(
+      "resolveRuntimeAgentId: resolved agentId is empty after trim, defaulting to 'main'."
+    );
+  }
   return trimmed ? trimmed : "main";
 }
 
