@@ -123,9 +123,11 @@ export class MemoryScopeManager implements ScopeManager {
 
     // Validate agent access scopes exist in definitions + reject reserved bypass IDs
     for (const [agentId, scopes] of Object.entries(this.config.agentAccess)) {
-      if (isSystemBypassId(agentId)) {
+      // Trim before checking to prevent space-padded bypass IDs like " system "
+      const trimmedAgentId = agentId.trim();
+      if (isSystemBypassId(trimmedAgentId)) {
         throw new Error(
-          `Reserved bypass agent ID '${agentId}' cannot have explicit access configured. ` +
+          `Reserved bypass agent ID '${trimmedAgentId}' cannot have explicit access configured. ` +
           `This is rejected in both constructor and importConfig paths.`
         );
       }
