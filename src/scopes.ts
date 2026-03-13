@@ -81,15 +81,22 @@ export function _resetLegacyFallbackWarningState(): void {
 }
 
 /**
- * Extract agentId from an OpenClaw session key (e.g., "agent:main:discord:channel:123").
+ * Extract agentId from an OpenClaw session key.
+ * Supports both formats:
+ *   - "agent:main:discord:channel:123" (with trailing segments)
+ *   - "agent:main" (two-segment, no trailing colon)
  * Returns undefined for missing keys, non-agent keys, or reserved bypass IDs.
  * This is the single canonical implementation — do not duplicate inline.
  */
 export function parseAgentIdFromSessionKey(sessionKey: string | undefined): string | undefined {
   if (!sessionKey) return undefined;
-  const m = /^agent:([^:]+):/.exec(sessionKey);
-  const candidate = m?.[1];
-  if (candidate && isSystemBypassId(candidate)) {
+  const sk = sessionKey.trim();
+  // Match "agent:<id>" with or without trailing segments
+  if (!sk.startsWith("agent:")) return undefined;
+  const rest = sk.slice("agent:".length);
+  const colonIdx = rest.indexOf(":");
+  const candidate = colonIdx === -1 ? rest : rest.slice(0, colonIdx);
+  if (!candidate || isSystemBypassId(candidate)) {
     return undefined;
   }
   return candidate;
