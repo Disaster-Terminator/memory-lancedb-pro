@@ -65,6 +65,20 @@ describe("MemoryScopeManager - System & Reflection Scopes", () => {
       assert.throws(() => manager.setAgentAccess("undefined", ["global"]), /Reserved bypass agent ID/);
     });
 
+    it("rejects reserved bypass identifiers in constructor and importConfig without corrupting state", () => {
+      assert.throws(
+        () => new MemoryScopeManager({ default: "global", agentAccess: { system: ["global"] } }),
+        /Reserved bypass agent ID/,
+      );
+
+      const before = manager.exportConfig();
+      assert.throws(
+        () => manager.importConfig({ default: "global", agentAccess: { undefined: ["global"] } }),
+        /Reserved bypass agent ID/,
+      );
+      assert.deepStrictEqual(manager.exportConfig(), before);
+    });
+
     it("warns when a legacy scope manager returns [] for a reserved bypass identifier", () => {
       const originalWarn = console.warn;
       const warnings = [];
