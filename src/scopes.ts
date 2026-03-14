@@ -346,19 +346,26 @@ export class MemoryScopeManager implements ScopeManager {
   }
 
   importConfig(config: Partial<ScopeConfig>): void {
-    this.config = {
-      default: config.default || this.config.default,
+    const previous = this.config;
+    const next: ScopeConfig = {
+      default: config.default || previous.default,
       definitions: {
-        ...this.config.definitions,
+        ...previous.definitions,
         ...config.definitions,
       },
       agentAccess: {
-        ...this.config.agentAccess,
+        ...previous.agentAccess,
         ...config.agentAccess,
       },
     };
 
-    this.validateConfiguration();
+    this.config = next;
+    try {
+      this.validateConfiguration();
+    } catch (err) {
+      this.config = previous;
+      throw err;
+    }
   }
 
   // Statistics
