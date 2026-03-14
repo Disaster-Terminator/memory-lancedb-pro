@@ -2482,6 +2482,12 @@ const memoryLanceDBProPlugin = {
         return sourceAgentId;
       };
 
+      const isHeartbeatPrompt = (prompt: unknown): boolean => {
+        if (typeof prompt !== "string") return false;
+        const normalized = prompt.trim();
+        return normalized.startsWith("Read HEARTBEAT.md if it exists");
+      };
+
       api.on("after_tool_call", (event, ctx) => {
         const sessionKey = typeof ctx.sessionKey === "string" ? ctx.sessionKey : "";
         if (isInternalReflectionSessionKey(sessionKey)) return;
@@ -2518,9 +2524,10 @@ const memoryLanceDBProPlugin = {
         }
       }, { priority: 15 });
 
-      api.on("before_agent_start", async (_event, ctx) => {
+      api.on("before_agent_start", async (event, ctx) => {
         const sessionKey = typeof ctx.sessionKey === "string" ? ctx.sessionKey : "";
         if (isInternalReflectionSessionKey(sessionKey)) return;
+        if (isHeartbeatPrompt(event?.prompt)) return;
         if (reflectionInjectMode !== "inheritance-only" && reflectionInjectMode !== "inheritance+derived") return;
         try {
           pruneReflectionSessionState();
@@ -2530,7 +2537,7 @@ const memoryLanceDBProPlugin = {
           if (slices.invariants.length === 0) return;
           const body = slices.invariants.slice(0, 6).map((line, i) => `${i + 1}. ${line}`).join("\n");
           return {
-            prependContext: [
+            prependSystemContext: [
               "<inherited-rules>",
               "Stable rules inherited from memory-lancedb-pro reflections. Treat as long-term behavioral constraints unless user overrides.",
               body,
@@ -2542,9 +2549,10 @@ const memoryLanceDBProPlugin = {
         }
       }, { priority: 12 });
 
-      api.on("before_prompt_build", async (_event, ctx) => {
+      api.on("before_prompt_build", async (event, ctx) => {
         const sessionKey = typeof ctx.sessionKey === "string" ? ctx.sessionKey : "";
         if (isInternalReflectionSessionKey(sessionKey)) return;
+        if (isHeartbeatPrompt(event?.prompt)) return;
         const agentId = typeof ctx.agentId === "string" && ctx.agentId.trim() ? ctx.agentId.trim() : "main";
         pruneReflectionSessionState();
 

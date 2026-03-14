@@ -83,14 +83,61 @@ describe("reflection hooks tolerate bypass scope filters", () => {
 
     for (const { handler } of startHooks) {
       await assert.doesNotReject(async () => {
-        await handler({}, { sessionKey: "agent:system:test", agentId: "system" });
+        await handler({ prompt: "normal run" }, { sessionKey: "agent:system:test", agentId: "system" });
       });
     }
 
     for (const { handler } of promptHooks) {
       await assert.doesNotReject(async () => {
-        await handler({}, { sessionKey: "agent:system:test", agentId: "system" });
+        await handler({ prompt: "normal run" }, { sessionKey: "agent:system:test", agentId: "system" });
       });
+    }
+  });
+
+  it("skips dynamic reflection prompt injection for heartbeat prompts", async () => {
+    const harness = createPluginApiHarness({
+      resolveRoot: workDir,
+      pluginConfig: {
+        dbPath: path.join(workDir, "db"),
+        embedding: { apiKey: "test-api-key" },
+        sessionStrategy: "memoryReflection",
+        smartExtraction: false,
+        autoCapture: false,
+        autoRecall: false,
+        selfImprovement: { enabled: false, beforeResetNote: false, ensureLearningFiles: false },
+      },
+    });
+
+    memoryLanceDBProPlugin.register(harness.api);
+
+    const afterToolHooks = harness.eventHandlers.get("after_tool_call") || [];
+    const promptHooks = harness.eventHandlers.get("before_prompt_build") || [];
+
+    assert.ok(afterToolHooks.length >= 1, "expected after_tool_call hooks");
+    assert.ok(promptHooks.length >= 1, "expected before_prompt_build hooks");
+
+    for (const { handler } of afterToolHooks) {
+      await handler(
+        { toolName: "read", error: "ENOENT: no such file or directory" },
+        { sessionKey: "agent:main:heartbeat-noise", agentId: "main" },
+      );
+    }
+
+    for (const { handler } of promptHooks) {
+      const heartbeatResult = await handler(
+        {
+          prompt:
+            "Read HEARTBEAT.md if it exists (workspace context). Follow it strictly. If nothing needs attention, reply HEARTBEAT_OK.",
+        },
+        { sessionKey: "agent:main:heartbeat-noise", agentId: "main" },
+      );
+      assert.equal(heartbeatResult, undefined);
+
+      const normalResult = await handler(
+        { prompt: "normal run" },
+        { sessionKey: "agent:main:heartbeat-noise", agentId: "main" },
+      );
+      assert.match(normalResult?.prependContext || "", /<error-detected>/);
     }
   });
 });
