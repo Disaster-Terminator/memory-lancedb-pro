@@ -86,6 +86,9 @@ interface PluginConfig {
   autoRecall?: boolean;
   autoRecallMinLength?: number;
   autoRecallMinRepeated?: number;
+  autoRecallMaxItems?: number;
+  autoRecallMaxChars?: number;
+  autoRecallPerItemMaxChars?: number;
   captureAssistant?: boolean;
   retrieval?: {
     mode?: "hybrid" | "vector";
@@ -215,6 +218,14 @@ function resolveEnvVars(value: string): string {
   });
 }
 
+function resolveFirstApiKey(apiKey: string | string[]): string {
+  const key = Array.isArray(apiKey) ? apiKey[0] : apiKey;
+  if (!key) {
+    throw new Error("embedding.apiKey is empty");
+  }
+  return resolveEnvVars(key);
+}
+
 function resolveOptionalPathWithEnv(
   api: Pick<OpenClawPluginApi, "resolvePath">,
   value: string | undefined,
@@ -236,6 +247,11 @@ function parsePositiveInt(value: unknown): number | undefined {
     if (Number.isFinite(n) && n > 0) return Math.floor(n);
   }
   return undefined;
+}
+
+function clampInt(value: number, min: number, max: number): number {
+  if (!Number.isFinite(value)) return min;
+  return Math.min(max, Math.max(min, Math.floor(value)));
 }
 
 function resolveLlmTimeoutMs(config: PluginConfig): number {
@@ -1718,7 +1734,7 @@ const memoryLanceDBProPlugin = {
           ? undefined
           : config.llm?.apiKey
             ? resolveEnvVars(config.llm.apiKey)
-            : resolveEnvVars(config.embedding.apiKey);
+            : resolveFirstApiKey(config.embedding.apiKey);
         const llmBaseURL = llmAuth === "oauth"
           ? (config.llm?.baseURL ? resolveEnvVars(config.llm.baseURL) : undefined)
           : config.llm?.baseURL
@@ -1760,7 +1776,7 @@ const memoryLanceDBProPlugin = {
 
         smartExtractor = new SmartExtractor(store, embedder, llmClient, {
           user: "User",
-          extractMinMessages: config.extractMinMessages ?? 2,
+          extractMinMessages: config.extractMinMessages ?? 4,
           extractMaxChars: config.extractMaxChars ?? 8000,
           defaultScope: config.scopes?.default ?? "global",
           workspaceBoundary: config.workspaceBoundary,
@@ -2094,7 +2110,7 @@ const memoryLanceDBProPlugin = {
               ? undefined
               : config.llm?.apiKey
                 ? resolveEnvVars(config.llm.apiKey)
-                : resolveEnvVars(config.embedding.apiKey);
+                : resolveFirstApiKey(config.embedding.apiKey);
             const llmBaseURL = llmAuth === "oauth"
               ? (config.llm?.baseURL ? resolveEnvVars(config.llm.baseURL) : undefined)
               : config.llm?.baseURL
@@ -2167,9 +2183,14 @@ const memoryLanceDBProPlugin = {
             );
           }
 
+          const autoRecallMaxItems = clampInt(config.autoRecallMaxItems ?? 3, 1, 20);
+          const autoRecallMaxChars = clampInt(config.autoRecallMaxChars ?? 600, 64, 8000);
+          const autoRecallPerItemMaxChars = clampInt(config.autoRecallPerItemMaxChars ?? 180, 32, 1000);
+          const retrieveLimit = clampInt(Math.max(autoRecallMaxItems * 2, autoRecallMaxItems), 1, 20);
+
           const results = filterUserMdExclusiveRecallResults(await retrieveWithRetry({
             query: recallQuery,
-            limit: 3,
+            limit: retrieveLimit,
             scopeFilter: accessibleScopes,
             source: "auto-recall",
           }), config.workspaceBoundary);
@@ -2178,9 +2199,9 @@ const memoryLanceDBProPlugin = {
             return;
           }
 
-          const tierOverrides = await runRecallLifecycle(results, accessibleScopes);
           // Filter out redundant memories based on session history
-          const minRepeated = config.autoRecallMinRepeated ?? 0;
+          const minRepeated = config.autoRecallMinRepeated ?? 8;
+          let dedupFilteredCount = 0;
 
           // Only enable dedup logic when minRepeated > 0
           let finalResults = results;
@@ -2197,6 +2218,7 @@ const memoryLanceDBProPlugin = {
                   `memory-lancedb-pro: skipping redundant memory ${r.entry.id.slice(0, 8)} (last seen at turn ${lastTurn}, current turn ${currentTurn}, min ${minRepeated})`,
                 );
               }
+              if (isRedundant) dedupFilteredCount++;
               return !isRedundant;
             });
 
@@ -2209,28 +2231,139 @@ const memoryLanceDBProPlugin = {
               return;
             }
 
-            // Update history with successfully injected memories
-            for (const r of filteredResults) {
-              sessionHistory.set(r.entry.id, currentTurn);
-            }
-            recallHistory.set(sessionId, sessionHistory);
-
             finalResults = filteredResults;
           }
 
-          const memoryContext = finalResults
-            .map((r) => {
-              const metaObj = parseSmartMetadata(r.entry.metadata, r.entry);
-              const displayCategory = metaObj.memory_category || r.entry.category;
-              const displayTier = tierOverrides.get(r.entry.id) || metaObj.tier || "";
-              const tierPrefix = displayTier ? `[${displayTier.charAt(0).toUpperCase()}]` : "";
-              const abstract = metaObj.l0_abstract || r.entry.text;
-              return `- ${tierPrefix}[${displayCategory}:${r.entry.scope}] ${sanitizeForContext(abstract)}`;
-            })
-            .join("\n");
+          let stateFilteredCount = 0;
+          let suppressedFilteredCount = 0;
+          const governanceEligible = finalResults.filter((r) => {
+            const meta = parseSmartMetadata(r.entry.metadata, r.entry);
+            if (meta.state !== "confirmed") {
+              stateFilteredCount++;
+              return false;
+            }
+            if (meta.memory_layer === "archive" || meta.memory_layer === "reflection") {
+              stateFilteredCount++;
+              return false;
+            }
+            if (meta.suppressed_until_turn > 0 && currentTurn <= meta.suppressed_until_turn) {
+              suppressedFilteredCount++;
+              return false;
+            }
+            return true;
+          });
+
+          if (governanceEligible.length === 0) {
+            api.logger.info?.(
+              `memory-lancedb-pro: auto-recall skipped after governance filters (hits=${results.length}, dedupFiltered=${dedupFilteredCount}, stateFiltered=${stateFilteredCount}, suppressedFiltered=${suppressedFilteredCount})`,
+            );
+            return;
+          }
+
+          const preBudgetCandidates = governanceEligible.map((r) => {
+            const metaObj = parseSmartMetadata(r.entry.metadata, r.entry);
+            const displayCategory = metaObj.memory_category || r.entry.category;
+            const displayTier = metaObj.tier || "";
+            const tierPrefix = displayTier ? `[${displayTier.charAt(0).toUpperCase()}]` : "";
+            const abstract = metaObj.l0_abstract || r.entry.text;
+            const summary = sanitizeForContext(abstract).slice(0, autoRecallPerItemMaxChars);
+            return {
+              id: r.entry.id,
+              prefix: `${tierPrefix}[${displayCategory}:${r.entry.scope}]`,
+              summary,
+              chars: summary.length,
+              meta: metaObj,
+            };
+          });
+
+          const preBudgetItems = preBudgetCandidates.length;
+          const preBudgetChars = preBudgetCandidates.reduce((sum, item) => sum + item.chars, 0);
+          const selected = [];
+          let usedChars = 0;
+
+          for (const candidate of preBudgetCandidates) {
+            if (selected.length >= autoRecallMaxItems) break;
+            const remaining = autoRecallMaxChars - usedChars;
+            if (remaining <= 0) break;
+
+            if (candidate.chars <= remaining) {
+              selected.push({
+                id: candidate.id,
+                line: `- ${candidate.prefix} ${candidate.summary}`,
+                chars: candidate.chars,
+                meta: candidate.meta,
+              });
+              usedChars += candidate.chars;
+              continue;
+            }
+
+            const shortened = candidate.summary.slice(0, remaining).trim();
+            if (!shortened) continue;
+            const line = `- ${candidate.prefix} ${shortened}`;
+            selected.push({
+              id: candidate.id,
+              line,
+              chars: shortened.length,
+              meta: candidate.meta,
+            });
+            usedChars += shortened.length;
+            break;
+          }
+
+          if (selected.length === 0) {
+            api.logger.info?.(
+              `memory-lancedb-pro: auto-recall skipped injection after budgeting (hits=${results.length}, dedupFiltered=${dedupFilteredCount}, maxItems=${autoRecallMaxItems}, maxChars=${autoRecallMaxChars})`,
+            );
+            return;
+          }
+
+          if (minRepeated > 0) {
+            const sessionHistory = recallHistory.get(sessionId) || new Map<string, number>();
+            for (const item of selected) {
+              sessionHistory.set(item.id, currentTurn);
+            }
+            recallHistory.set(sessionId, sessionHistory);
+          }
+
+          const injectedAt = Date.now();
+          await Promise.allSettled(
+            selected.map(async (item) => {
+              const meta = item.meta;
+              const staleInjected =
+                typeof meta.last_injected_at === "number" &&
+                meta.last_injected_at > 0 &&
+                (
+                  typeof meta.last_confirmed_use_at !== "number" ||
+                  meta.last_confirmed_use_at < meta.last_injected_at
+                );
+              const nextBadRecallCount = staleInjected
+                ? meta.bad_recall_count + 1
+                : meta.bad_recall_count;
+              const shouldSuppress = nextBadRecallCount >= 3 && minRepeated > 0;
+              await store.patchMetadata(
+                item.id,
+                {
+                  injected_count: meta.injected_count + 1,
+                  last_injected_at: injectedAt,
+                  bad_recall_count: nextBadRecallCount,
+                  suppressed_until_turn: shouldSuppress
+                    ? Math.max(meta.suppressed_until_turn, currentTurn + minRepeated)
+                    : meta.suppressed_until_turn,
+                },
+                accessibleScopes,
+              );
+            }),
+          );
+
+          const memoryContext = selected.map((item) => item.line).join("\n");
+
+          const injectedIds = selected.map((item) => item.id).join(",") || "(none)";
+          api.logger.debug?.(
+            `memory-lancedb-pro: auto-recall stats hits=${results.length}, dedupFiltered=${dedupFilteredCount}, stateFiltered=${stateFilteredCount}, suppressedFiltered=${suppressedFilteredCount}, preBudgetItems=${preBudgetItems}, preBudgetChars=${preBudgetChars}, postBudgetItems=${selected.length}, postBudgetChars=${usedChars}, maxItems=${autoRecallMaxItems}, maxChars=${autoRecallMaxChars}, perItemMaxChars=${autoRecallPerItemMaxChars}, injectedIds=${injectedIds}`,
+          );
 
           api.logger.info?.(
-            `memory-lancedb-pro: injecting ${finalResults.length} memories into context for agent ${agentId}`,
+            `memory-lancedb-pro: injecting ${selected.length} memories into context for agent ${agentId}`,
           );
 
           return {
@@ -2378,7 +2511,7 @@ const memoryLanceDBProPlugin = {
             pruneMapIfOver(autoCaptureRecentTexts, AUTO_CAPTURE_MAP_MAX_ENTRIES);
           }
 
-          const minMessages = config.extractMinMessages ?? 2;
+          const minMessages = config.extractMinMessages ?? 4;
           if (skippedAutoCaptureTexts > 0) {
             api.logger.debug(
               `memory-lancedb-pro: auto-capture skipped ${skippedAutoCaptureTexts} injected/system text block(s) for agent ${agentId}`,
@@ -2477,9 +2610,9 @@ const memoryLanceDBProPlugin = {
             `memory-lancedb-pro: regex fallback found ${toCapture.length} capturable text(s) for agent ${agentId}`,
           );
 
-          // Store each capturable piece (limit to 3 per conversation)
+          // Store each capturable piece (limit to 2 per conversation)
           let stored = 0;
-          for (const text of toCapture.slice(0, 3)) {
+          for (const text of toCapture.slice(0, 2)) {
             if (isUserMdExclusiveMemory({ text }, config.workspaceBoundary)) {
               api.logger.info(
                 `memory-lancedb-pro: skipped USER.md-exclusive auto-capture text for agent ${agentId}`,
@@ -2525,6 +2658,12 @@ const memoryLanceDBProPlugin = {
                     l1_overview: `- ${text}`,
                     l2_content: text,
                     source_session: (event as any).sessionKey || "unknown",
+                    source: "auto-capture",
+                    state: "pending",
+                    memory_layer: "working",
+                    injected_count: 0,
+                    bad_recall_count: 0,
+                    suppressed_until_turn: 0,
                   },
                 ),
               ),
@@ -3476,7 +3615,10 @@ export function parsePluginConfig(value: unknown): PluginConfig {
     // Default OFF: only enable when explicitly set to true.
     autoRecall: cfg.autoRecall === true,
     autoRecallMinLength: parsePositiveInt(cfg.autoRecallMinLength),
-    autoRecallMinRepeated: parsePositiveInt(cfg.autoRecallMinRepeated),
+    autoRecallMinRepeated: parsePositiveInt(cfg.autoRecallMinRepeated) ?? 8,
+    autoRecallMaxItems: parsePositiveInt(cfg.autoRecallMaxItems) ?? 3,
+    autoRecallMaxChars: parsePositiveInt(cfg.autoRecallMaxChars) ?? 600,
+    autoRecallPerItemMaxChars: parsePositiveInt(cfg.autoRecallPerItemMaxChars) ?? 180,
     captureAssistant: cfg.captureAssistant === true,
     retrieval: typeof cfg.retrieval === "object" && cfg.retrieval !== null ? cfg.retrieval as any : undefined,
     decay: typeof cfg.decay === "object" && cfg.decay !== null ? cfg.decay as any : undefined,
@@ -3484,7 +3626,7 @@ export function parsePluginConfig(value: unknown): PluginConfig {
     // Smart extraction config (Phase 1)
     smartExtraction: cfg.smartExtraction !== false, // Default ON
     llm: typeof cfg.llm === "object" && cfg.llm !== null ? cfg.llm as any : undefined,
-    extractMinMessages: parsePositiveInt(cfg.extractMinMessages) ?? 2,
+    extractMinMessages: parsePositiveInt(cfg.extractMinMessages) ?? 4,
     extractMaxChars: parsePositiveInt(cfg.extractMaxChars) ?? 8000,
     scopes: typeof cfg.scopes === "object" && cfg.scopes !== null ? cfg.scopes as any : undefined,
     enableManagementTools: cfg.enableManagementTools === true,

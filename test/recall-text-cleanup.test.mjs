@@ -185,11 +185,96 @@ function makeLegacyAddressingResults() {
   ];
 }
 
+function makeManyResults(count = 7) {
+  return Array.from({ length: count }, (_, i) => {
+    const id = `m${i + 1}`;
+    return {
+      entry: {
+        id,
+        text: `memory-${i + 1} ${"x".repeat(240)}`,
+        category: "fact",
+        scope: "global",
+        importance: 0.5,
+        timestamp: Date.now(),
+      },
+      score: 0.9 - i * 0.05,
+      sources: {
+        vector: { score: 0.9 - i * 0.05, rank: i + 1 },
+      },
+    };
+  });
+}
+
+function makeGovernanceFilteredResults() {
+  const now = Date.now();
+  return [
+    {
+      entry: {
+        id: "c1",
+        text: "confirmed durable memory",
+        category: "fact",
+        scope: "global",
+        importance: 0.7,
+        timestamp: now,
+        metadata: JSON.stringify({
+          l0_abstract: "confirmed durable memory",
+          memory_category: "cases",
+          state: "confirmed",
+          memory_layer: "durable",
+          source: "manual",
+        }),
+      },
+      score: 0.93,
+      sources: { vector: { score: 0.93, rank: 1 } },
+    },
+    {
+      entry: {
+        id: "p1",
+        text: "pending memory should not auto-recall",
+        category: "fact",
+        scope: "global",
+        importance: 0.7,
+        timestamp: now,
+        metadata: JSON.stringify({
+          l0_abstract: "pending memory should not auto-recall",
+          memory_category: "cases",
+          state: "pending",
+          memory_layer: "working",
+          source: "auto-capture",
+        }),
+      },
+      score: 0.9,
+      sources: { vector: { score: 0.9, rank: 2 } },
+    },
+    {
+      entry: {
+        id: "a1",
+        text: "archived memory should not auto-recall",
+        category: "fact",
+        scope: "global",
+        importance: 0.7,
+        timestamp: now,
+        metadata: JSON.stringify({
+          l0_abstract: "archived memory should not auto-recall",
+          memory_category: "cases",
+          state: "archived",
+          memory_layer: "archive",
+          source: "manual",
+        }),
+      },
+      score: 0.88,
+      sources: { vector: { score: 0.88, rank: 3 } },
+    },
+  ];
+}
+
 function makeRecallContext(results = makeResults()) {
   return {
     retriever: {
-      async retrieve() {
-        return results;
+      async retrieve(params = {}) {
+        const rawLimit = typeof params.limit === "number" ? params.limit : results.length;
+        const safeLimit = Math.max(1, Math.floor(rawLimit));
+        return results.slice(0, safeLimit);
       },
       getConfig() {
         return { mode: "hybrid" };
@@ -305,6 +390,101 @@ describe("recall text cleanup", () => {
     assert.doesNotMatch(output.prependContext, /vector\+BM25/);
     assert.doesNotMatch(output.prependContext, /reranked/);
     assert.doesNotMatch(output.prependContext, /\d+%/);
+  });
+
+  it("defaults memory_recall to concise output (limit=3, preview text)", async () => {
+    const tool = createTool(registerMemoryRecallTool, makeRecallContext(makeManyResults(7)));
+    const res = await tool.execute(null, { query: "many memories" });
+    const lines = extractRenderedMemoryRecallLines(res.content[0].text);
+
+    assert.equal(lines.length, 3, "default recall should return 3 items");
+    assert.match(lines[0], /…$/, "default recall should return truncated preview text");
+  });
+
+  it("caps summary-mode memory_recall results to 6 even if a larger limit is requested", async () => {
+    const tool = createTool(registerMemoryRecallTool, makeRecallContext(makeManyResults(9)));
+    const res = await tool.execute(null, { query: "many memories", limit: 10 });
+    const lines = extractRenderedMemoryRecallLines(res.content[0].text);
+
+    assert.equal(lines.length, 6, "summary mode should clamp limit to 6");
+  });
+
+  it("allows larger limits when includeFullText=true", async () => {
+    const tool = createTool(registerMemoryRecallTool, makeRecallContext(makeManyResults(9)));
+    const res = await tool.execute(null, {
+      query: "many memories",
+      limit: 7,
+      includeFullText: true,
+    });
+    const lines = extractRenderedMemoryRecallLines(res.content[0].text);
+
+    assert.equal(lines.length, 7, "full text mode should honor larger limits");
+    assert.doesNotMatch(lines[0], /…$/, "full text mode should not force preview truncation");
+  });
+
+  it("applies auto-recall item/char budgets before injecting context", async () => {
+    MemoryRetriever.prototype.retrieve = async () => makeManyResults(5);
+
+    const harness = createPluginApiHarness({
+      resolveRoot: workspaceDir,
+      pluginConfig: {
+        dbPath: path.join(workspaceDir, "db"),
+        embedding: { apiKey: "test-api-key" },
+        smartExtraction: false,
+        autoCapture: false,
+        autoRecall: true,
+        autoRecallMinLength: 1,
+        autoRecallMaxItems: 2,
+        autoRecallMaxChars: 160,
+        autoRecallPerItemMaxChars: 100,
+        selfImprovement: { enabled: false, beforeResetNote: false, ensureLearningFiles: false },
+      },
+    });
+
+    memoryLanceDBProPlugin.register(harness.api);
+    const hooks = harness.eventHandlers.get("before_agent_start") || [];
+    const [{ handler: autoRecallHook }] = hooks;
+    const output = await autoRecallHook(
+      { prompt: "Please recall what I mentioned before about this task." },
+      { sessionId: "auto-budget", sessionKey: "agent:main:session:auto-budget", agentId: "main" }
+    );
+
+    assert.ok(output);
+    const injectedLines = output.prependContext
+      .split(/\r?\n/)
+      .map((line) => line.trim())
+      .filter((line) => line.startsWith("- "));
+    assert.ok(injectedLines.length <= 2, "injected lines should respect autoRecallMaxItems");
+  });
+
+  it("auto-recall only injects confirmed non-archived memories", async () => {
+    MemoryRetriever.prototype.retrieve = async () => makeGovernanceFilteredResults();
+
+    const harness = createPluginApiHarness({
+      resolveRoot: workspaceDir,
+      pluginConfig: {
+        dbPath: path.join(workspaceDir, "db"),
+        embedding: { apiKey: "test-api-key" },
+        smartExtraction: false,
+        autoCapture: false,
+        autoRecall: true,
+        autoRecallMinLength: 1,
+        autoRecallMaxItems: 5,
+        selfImprovement: { enabled: false, beforeResetNote: false, ensureLearningFiles: false },
+      },
+    });
+    memoryLanceDBProPlugin.register(harness.api);
+    const hooks = harness.eventHandlers.get("before_agent_start") || [];
+    const [{ handler: autoRecallHook }] = hooks;
+    const output = await autoRecallHook(
+      { prompt: "Please recall what I mentioned before about this task." },
+      { sessionId: "auto-governance", sessionKey: "agent:main:session:auto-governance", agentId: "main" }
+    );
+
+    assert.ok(output);
+    assert.match(output.prependContext, /confirmed durable memory/);
+    assert.doesNotMatch(output.prependContext, /pending memory should not auto-recall/);
+    assert.doesNotMatch(output.prependContext, /archived memory should not auto-recall/);
   });
 
   it("filters USER.md-exclusive facts from memory_recall output", async () => {

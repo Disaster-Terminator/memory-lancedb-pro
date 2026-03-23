@@ -918,31 +918,34 @@ export class SmartExtractor {
       scope: targetScope,
       importance: this.getDefaultImportance(candidate.category),
       metadata: stringifySmartMetadata(
-        this.withAdmissionAudit(
-          buildSmartMetadata(
-            {
-              text: candidate.abstract,
-              category: storeCategory,
-            },
-            {
-              l0_abstract: candidate.abstract,
-              l1_overview: candidate.overview,
-              l2_content: candidate.content,
-              memory_category: candidate.category,
-              tier: "working",
-              access_count: 0,
-              confidence: 0.7,
-              source_session: sessionKey,
-              valid_from: now,
-              fact_key: factKey,
-              supersedes: matchId,
-              relations: appendRelation([], {
-                type: "supersedes",
-                targetId: matchId,
-              }),
-            },
-          ),
-          admissionAudit,
+        buildSmartMetadata(
+          {
+            text: candidate.abstract,
+            category: storeCategory,
+          },
+          {
+            l0_abstract: candidate.abstract,
+            l1_overview: candidate.overview,
+            l2_content: candidate.content,
+            memory_category: candidate.category,
+            tier: "working",
+            access_count: 0,
+            confidence: 0.7,
+            source_session: sessionKey,
+            source: "auto-capture",
+            state: "pending",
+            memory_layer: "working",
+            injected_count: 0,
+            bad_recall_count: 0,
+            suppressed_until_turn: 0,
+            valid_from: now,
+            fact_key: factKey,
+            supersedes: matchId,
+            relations: appendRelation([], {
+              type: "supersedes",
+              targetId: matchId,
+            }),
+          },
         ),
       ),
     });
@@ -1027,6 +1030,12 @@ export class SmartExtractor {
       confidence: 0.7,
       last_accessed_at: Date.now(),
       source_session: sessionKey,
+      source: "auto-capture" as const,
+      state: "pending" as const,
+      memory_layer: "working" as const,
+      injected_count: 0,
+      bad_recall_count: 0,
+      suppressed_until_turn: 0,
       contexts: contextLabel ? [contextLabel] : [],
       relations: [{ type: "contextualizes", targetId: matchId }],
     }, admissionAudit));
@@ -1085,6 +1094,12 @@ export class SmartExtractor {
       confidence: 0.7,
       last_accessed_at: Date.now(),
       source_session: sessionKey,
+      source: "auto-capture" as const,
+      state: "pending" as const,
+      memory_layer: "working" as const,
+      injected_count: 0,
+      bad_recall_count: 0,
+      suppressed_until_turn: 0,
       contexts: contextLabel ? [contextLabel] : [],
       relations: [{ type: "contradicts", targetId: matchId }],
     }, admissionAudit));
@@ -1121,24 +1136,27 @@ export class SmartExtractor {
     const storeCategory = this.mapToStoreCategory(candidate.category);
 
     const metadata = stringifySmartMetadata(
-      this.withAdmissionAudit(
-        buildSmartMetadata(
-          {
-            text: candidate.abstract,
-            category: this.mapToStoreCategory(candidate.category),
-          },
-          {
-            l0_abstract: candidate.abstract,
-            l1_overview: candidate.overview,
-            l2_content: candidate.content,
-            memory_category: candidate.category,
-            tier: "working",
-            access_count: 0,
-            confidence: 0.7,
-            source_session: sessionKey,
-          },
-        ),
-        admissionAudit,
+      buildSmartMetadata(
+        {
+          text: candidate.abstract,
+          category: this.mapToStoreCategory(candidate.category),
+        },
+        {
+          l0_abstract: candidate.abstract,
+          l1_overview: candidate.overview,
+          l2_content: candidate.content,
+          memory_category: candidate.category,
+          tier: "working",
+          access_count: 0,
+          confidence: 0.7,
+          source_session: sessionKey,
+          source: "auto-capture",
+          state: "pending",
+          memory_layer: "working",
+          injected_count: 0,
+          bad_recall_count: 0,
+          suppressed_until_turn: 0,
+        },
       ),
     );
 

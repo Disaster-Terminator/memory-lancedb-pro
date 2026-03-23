@@ -56,7 +56,15 @@ function createMockApi(pluginConfig, options = {}) {
   };
 }
 
-for (const key of ["smartExtraction", "extractMinMessages", "extractMaxChars", "llm"]) {
+for (const key of [
+  "smartExtraction",
+  "extractMinMessages",
+  "extractMaxChars",
+  "llm",
+  "autoRecallMaxItems",
+  "autoRecallMaxChars",
+  "autoRecallPerItemMaxChars",
+]) {
   assert.ok(
     Object.prototype.hasOwnProperty.call(manifest.configSchema.properties, key),
     `configSchema should declare ${key}`,
@@ -76,6 +84,16 @@ assert.ok(
   "configSchema should declare llm.oauthProvider",
 );
 
+assert.equal(
+  manifest.configSchema.properties.autoRecallMinRepeated.default,
+  8,
+  "autoRecallMinRepeated schema default should be conservative",
+);
+assert.equal(
+  manifest.configSchema.properties.extractMinMessages.default,
+  4,
+  "extractMinMessages schema default should reduce aggressive auto-capture",
+);
 assert.equal(
   manifest.configSchema.properties.autoCapture.default,
   true,

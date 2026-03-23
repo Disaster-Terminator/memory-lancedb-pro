@@ -84,6 +84,23 @@ function clamp01(value: number, fallback = 0.7): number {
   return Math.min(1, Math.max(0, value));
 }
 
+function normalizeInlineText(text: string): string {
+  return text.replace(/[\r\n]+/g, " ").replace(/\s+/g, " ").trim();
+}
+
+function truncateText(text: string, maxChars: number): string {
+  if (text.length <= maxChars) return text;
+  const clipped = text.slice(0, Math.max(1, maxChars - 1)).trimEnd();
+  return `${clipped}…`;
+}
+
+function deriveManualMemoryLayer(category: string): "durable" | "working" {
+  if (category === "preference" || category === "decision" || category === "fact") {
+    return "durable";
+  }
+  return "working";
+}
+
 function sanitizeMemoryForSerialization(results: RetrievalResult[]) {
   return results.map((r) => ({
     id: r.entry.id,
@@ -162,6 +179,60 @@ async function retrieveWithRetry(
     results = await retriever.retrieve(params);
   }
   return results;
+}
+
+async function resolveMemoryId(
+  context: ToolContext,
+  memoryRef: string,
+  scopeFilter: string[],
+): Promise<
+  | { ok: true; id: string }
+  | { ok: false; message: string; details?: Record<string, unknown> }
+> {
+  const trimmed = memoryRef.trim();
+  if (!trimmed) {
+    return {
+      ok: false,
+      message: "memoryId/query 不能为空。",
+      details: { error: "empty_memory_ref" },
+    };
+  }
+
+  const uuidLike = /^[0-9a-f]{8}(-[0-9a-f]{4}){0,4}/i.test(trimmed);
+  if (uuidLike) {
+    return { ok: true, id: trimmed };
+  }
+
+  const results = await retrieveWithRetry(context.retriever, {
+    query: trimmed,
+    limit: 5,
+    scopeFilter,
+  });
+  if (results.length === 0) {
+    return {
+      ok: false,
+      message: `No memory found matching "${trimmed}".`,
+      details: { error: "not_found", query: trimmed },
+    };
+  }
+  if (results.length === 1 || results[0].score > 0.85) {
+    return { ok: true, id: results[0].entry.id };
+  }
+
+  const list = results
+    .map(
+      (r) =>
+        `- [${r.entry.id.slice(0, 8)}] ${r.entry.text.slice(0, 60)}${r.entry.text.length > 60 ? "..." : ""}`,
+    )
+    .join("\n");
+  return {
+    ok: false,
+    message: `Multiple matches. Specify memoryId:\n${list}`,
+    details: {
+      action: "candidates",
+      candidates: sanitizeMemoryForSerialization(results),
+    },
+  };
 }
 
 function resolveWorkspaceDir(toolCtx: unknown, fallback?: string): string {
@@ -433,7 +504,17 @@ export function registerMemoryRecallTool(
         }),
         limit: Type.Optional(
           Type.Number({
-            description: "Max results to return (default: 5, max: 20)",
+            description: "Max results to return (default: 3, max: 20; summary mode soft max: 6)",
+          }),
+        ),
+        includeFullText: Type.Optional(
+          Type.Boolean({
+            description: "Return full memory text when true (default: false returns summary previews)",
+          }),
+        ),
+        maxCharsPerItem: Type.Optional(
+          Type.Number({
+            description: "Maximum characters per returned memory in summary mode (default: 180)",
           }),
         ),
         scope: Type.Optional(
@@ -446,18 +527,25 @@ export function registerMemoryRecallTool(
       async execute(_toolCallId, params) {
         const {
           query,
-          limit = 5,
+          limit = 3,
+          includeFullText = false,
+          maxCharsPerItem = 180,
           scope,
           category,
         } = params as {
           query: string;
           limit?: number;
+          includeFullText?: boolean;
+          maxCharsPerItem?: number;
           scope?: string;
           category?: string;
         };
 
         try {
-          const safeLimit = clampInt(limit, 1, 20);
+          const safeLimit = includeFullText
+            ? clampInt(limit, 1, 20)
+            : clampInt(limit, 1, 6);
+          const safeCharsPerItem = clampInt(maxCharsPerItem, 60, 1000);
           const agentId = runtimeContext.agentId;
 
           // Determine accessible scopes
@@ -502,6 +590,9 @@ export function registerMemoryRecallTool(
                 {
                   access_count: meta.access_count + 1,
                   last_accessed_at: now,
+                  last_confirmed_use_at: now,
+                  bad_recall_count: 0,
+                  suppressed_until_turn: 0,
                 },
                 scopeFilter,
               );
@@ -511,7 +602,15 @@ export function registerMemoryRecallTool(
           const text = results
             .map((r, i) => {
               const categoryTag = getDisplayCategoryTag(r.entry);
-              return `${i + 1}. [${r.entry.id}] [${categoryTag}] ${r.entry.text}`;
+              const metadata = parseSmartMetadata(r.entry.metadata, r.entry);
+              const base = includeFullText
+                ? r.entry.text
+                : metadata.l0_abstract || r.entry.text;
+              const inline = normalizeInlineText(base);
+              const rendered = includeFullText
+                ? inline
+                : truncateText(inline, safeCharsPerItem);
+              return `${i + 1}. [${r.entry.id}] [${categoryTag}] ${rendered}`;
             })
             .join("\n");
 
@@ -708,6 +807,12 @@ export function registerMemoryStoreTool(
                   l0_abstract: text,
                   l1_overview: `- ${text}`,
                   l2_content: text,
+                  source: "manual",
+                  state: "confirmed",
+                  memory_layer: deriveManualMemoryLayer(category as string),
+                  last_confirmed_use_at: Date.now(),
+                  bad_recall_count: 0,
+                  suppressed_until_turn: 0,
                 },
               ),
             ),
@@ -1411,6 +1516,390 @@ export function registerMemoryListTool(
   );
 }
 
+export function registerMemoryPromoteTool(
+  api: OpenClawPluginApi,
+  context: ToolContext,
+) {
+  api.registerTool(
+    (toolCtx) => {
+      const runtimeContext = resolveToolContext(context, toolCtx);
+      return {
+        name: "memory_promote",
+        label: "Memory Promote",
+        description:
+          "Promote a memory into confirmed/durable governance state so it can participate in conservative auto-recall.",
+        parameters: Type.Object({
+          memoryId: Type.Optional(
+            Type.String({ description: "Memory id (UUID/prefix). Optional when query is provided." }),
+          ),
+          query: Type.Optional(
+            Type.String({ description: "Search query to locate a memory when memoryId is omitted." }),
+          ),
+          scope: Type.Optional(Type.String({ description: "Optional scope filter." })),
+          state: Type.Optional(Type.Union([
+            Type.Literal("pending"),
+            Type.Literal("confirmed"),
+            Type.Literal("archived"),
+          ])),
+          layer: Type.Optional(Type.Union([
+            Type.Literal("durable"),
+            Type.Literal("working"),
+            Type.Literal("reflection"),
+            Type.Literal("archive"),
+          ])),
+        }),
+        async execute(_toolCallId, params, _signal, _onUpdate, runtimeCtx) {
+          const {
+            memoryId,
+            query,
+            scope,
+            state = "confirmed",
+            layer = "durable",
+          } = params as {
+            memoryId?: string;
+            query?: string;
+            scope?: string;
+            state?: "pending" | "confirmed" | "archived";
+            layer?: "durable" | "working" | "reflection" | "archive";
+          };
+
+          if (!memoryId && !query) {
+            return {
+              content: [{ type: "text", text: "Provide memoryId or query." }],
+              details: { error: "missing_selector" },
+            };
+          }
+
+          const agentId = resolveRuntimeAgentId(runtimeContext.agentId, runtimeCtx);
+          let scopeFilter = resolveScopeFilter(context.scopeManager, agentId);
+          if (scope) {
+            if (!context.scopeManager.isAccessible(scope, agentId)) {
+              return {
+                content: [{ type: "text", text: `Access denied to scope: ${scope}` }],
+                details: { error: "scope_access_denied", requestedScope: scope },
+              };
+            }
+            scopeFilter = [scope];
+          }
+
+          const resolved = await resolveMemoryId(
+            runtimeContext,
+            memoryId ?? query ?? "",
+            scopeFilter,
+          );
+          if (!resolved.ok) {
+            return {
+              content: [{ type: "text", text: resolved.message }],
+              details: resolved.details ?? { error: "resolve_failed" },
+            };
+          }
+
+          const before = await runtimeContext.store.getById(resolved.id, scopeFilter);
+          if (!before) {
+            return {
+              content: [{ type: "text", text: `Memory ${resolved.id.slice(0, 8)} not found.` }],
+              details: { error: "not_found", id: resolved.id },
+            };
+          }
+
+          const now = Date.now();
+          const updated = await runtimeContext.store.patchMetadata(
+            resolved.id,
+            {
+              source: "manual",
+              state,
+              memory_layer: layer,
+              last_confirmed_use_at: state === "confirmed" ? now : undefined,
+              bad_recall_count: 0,
+              suppressed_until_turn: 0,
+            },
+            scopeFilter,
+          );
+          if (!updated) {
+            return {
+              content: [{ type: "text", text: `Failed to promote memory ${resolved.id.slice(0, 8)}.` }],
+              details: { error: "promote_failed", id: resolved.id },
+            };
+          }
+
+          return {
+            content: [{
+              type: "text",
+              text: `Promoted memory ${resolved.id.slice(0, 8)} to state=${state}, layer=${layer}.`,
+            }],
+            details: {
+              action: "promoted",
+              id: resolved.id,
+              state,
+              layer,
+            },
+          };
+        },
+      };
+    },
+    { name: "memory_promote" },
+  );
+}
+
+export function registerMemoryArchiveTool(
+  api: OpenClawPluginApi,
+  context: ToolContext,
+) {
+  api.registerTool(
+    (toolCtx) => {
+      const runtimeContext = resolveToolContext(context, toolCtx);
+      return {
+        name: "memory_archive",
+        label: "Memory Archive",
+        description:
+          "Archive a memory to remove it from default auto-recall while preserving history.",
+        parameters: Type.Object({
+          memoryId: Type.Optional(Type.String({ description: "Memory id (UUID/prefix)." })),
+          query: Type.Optional(Type.String({ description: "Search query when memoryId is omitted." })),
+          scope: Type.Optional(Type.String({ description: "Optional scope filter." })),
+          reason: Type.Optional(Type.String({ description: "Archive reason for audit trail." })),
+        }),
+        async execute(_toolCallId, params, _signal, _onUpdate, runtimeCtx) {
+          const { memoryId, query, scope, reason = "manual_archive" } = params as {
+            memoryId?: string;
+            query?: string;
+            scope?: string;
+            reason?: string;
+          };
+          if (!memoryId && !query) {
+            return {
+              content: [{ type: "text", text: "Provide memoryId or query." }],
+              details: { error: "missing_selector" },
+            };
+          }
+
+          const agentId = resolveRuntimeAgentId(runtimeContext.agentId, runtimeCtx);
+          let scopeFilter = resolveScopeFilter(context.scopeManager, agentId);
+          if (scope) {
+            if (!context.scopeManager.isAccessible(scope, agentId)) {
+              return {
+                content: [{ type: "text", text: `Access denied to scope: ${scope}` }],
+                details: { error: "scope_access_denied", requestedScope: scope },
+              };
+            }
+            scopeFilter = [scope];
+          }
+
+          const resolved = await resolveMemoryId(
+            runtimeContext,
+            memoryId ?? query ?? "",
+            scopeFilter,
+          );
+          if (!resolved.ok) {
+            return {
+              content: [{ type: "text", text: resolved.message }],
+              details: resolved.details ?? { error: "resolve_failed" },
+            };
+          }
+
+          const patch = {
+            state: "archived" as const,
+            memory_layer: "archive" as const,
+            archive_reason: reason,
+            archived_at: Date.now(),
+          };
+          const updated = await runtimeContext.store.patchMetadata(resolved.id, patch, scopeFilter);
+          if (!updated) {
+            return {
+              content: [{ type: "text", text: `Failed to archive memory ${resolved.id.slice(0, 8)}.` }],
+              details: { error: "archive_failed", id: resolved.id },
+            };
+          }
+
+          return {
+            content: [{ type: "text", text: `Archived memory ${resolved.id.slice(0, 8)}.` }],
+            details: { action: "archived", id: resolved.id, reason },
+          };
+        },
+      };
+    },
+    { name: "memory_archive" },
+  );
+}
+
+export function registerMemoryCompactTool(
+  api: OpenClawPluginApi,
+  context: ToolContext,
+) {
+  api.registerTool(
+    (toolCtx) => {
+      const runtimeContext = resolveToolContext(context, toolCtx);
+      return {
+        name: "memory_compact",
+        label: "Memory Compact",
+        description:
+          "Compact duplicate low-value memories by archiving redundant entries and linking them to a canonical memory.",
+        parameters: Type.Object({
+          scope: Type.Optional(Type.String({ description: "Optional scope filter." })),
+          dryRun: Type.Optional(Type.Boolean({ description: "Preview compaction only (default true)." })),
+          limit: Type.Optional(Type.Number({ description: "Max entries to scan (default 200)." })),
+        }),
+        async execute(_toolCallId, params, _signal, _onUpdate, runtimeCtx) {
+          const { scope, dryRun = true, limit = 200 } = params as {
+            scope?: string;
+            dryRun?: boolean;
+            limit?: number;
+          };
+
+          const safeLimit = clampInt(limit, 20, 1000);
+          const agentId = resolveRuntimeAgentId(runtimeContext.agentId, runtimeCtx);
+          let scopeFilter = resolveScopeFilter(context.scopeManager, agentId);
+          if (scope) {
+            if (!context.scopeManager.isAccessible(scope, agentId)) {
+              return {
+                content: [{ type: "text", text: `Access denied to scope: ${scope}` }],
+                details: { error: "scope_access_denied", requestedScope: scope },
+              };
+            }
+            scopeFilter = [scope];
+          }
+
+          const entries = await runtimeContext.store.list(scopeFilter, undefined, safeLimit, 0);
+          const canonicalByKey = new Map<string, typeof entries[number]>();
+          const duplicates: Array<{ duplicateId: string; canonicalId: string; key: string }> = [];
+
+          for (const entry of entries) {
+            const meta = parseSmartMetadata(entry.metadata, entry);
+            if (meta.state === "archived") continue;
+            const key = `${meta.memory_category}:${normalizeInlineText(meta.l0_abstract).toLowerCase()}`;
+            const existing = canonicalByKey.get(key);
+            if (!existing) {
+              canonicalByKey.set(key, entry);
+              continue;
+            }
+            const keep =
+              existing.timestamp >= entry.timestamp ? existing : entry;
+            const drop =
+              keep.id === existing.id ? entry : existing;
+            canonicalByKey.set(key, keep);
+            duplicates.push({ duplicateId: drop.id, canonicalId: keep.id, key });
+          }
+
+          let archivedCount = 0;
+          if (!dryRun) {
+            for (const item of duplicates) {
+              await runtimeContext.store.patchMetadata(
+                item.duplicateId,
+                {
+                  state: "archived",
+                  memory_layer: "archive",
+                  canonical_id: item.canonicalId,
+                  archive_reason: "compact_duplicate",
+                  archived_at: Date.now(),
+                },
+                scopeFilter,
+              );
+              archivedCount++;
+            }
+          }
+
+          return {
+            content: [{
+              type: "text",
+              text: dryRun
+                ? `Compaction preview: ${duplicates.length} duplicate(s) detected across ${entries.length} entries.`
+                : `Compaction complete: archived ${archivedCount} duplicate memory record(s).`,
+            }],
+            details: {
+              action: dryRun ? "compact_preview" : "compact_applied",
+              scanned: entries.length,
+              duplicates: duplicates.length,
+              archived: archivedCount,
+              sample: duplicates.slice(0, 20),
+            },
+          };
+        },
+      };
+    },
+    { name: "memory_compact" },
+  );
+}
+
+export function registerMemoryExplainRankTool(
+  api: OpenClawPluginApi,
+  context: ToolContext,
+) {
+  api.registerTool(
+    (toolCtx) => {
+      const runtimeContext = resolveToolContext(context, toolCtx);
+      return {
+        name: "memory_explain_rank",
+        label: "Memory Explain Rank",
+        description:
+          "Run recall and explain why each memory was ranked, including governance metadata (state/layer/source/suppression).",
+        parameters: Type.Object({
+          query: Type.String({ description: "Query used for ranking analysis." }),
+          limit: Type.Optional(Type.Number({ description: "How many items to explain (default 5)." })),
+          scope: Type.Optional(Type.String({ description: "Optional scope filter." })),
+        }),
+        async execute(_toolCallId, params, _signal, _onUpdate, runtimeCtx) {
+          const { query, limit = 5, scope } = params as {
+            query: string;
+            limit?: number;
+            scope?: string;
+          };
+
+          const safeLimit = clampInt(limit, 1, 20);
+          const agentId = resolveRuntimeAgentId(runtimeContext.agentId, runtimeCtx);
+          let scopeFilter = resolveScopeFilter(context.scopeManager, agentId);
+          if (scope) {
+            if (!context.scopeManager.isAccessible(scope, agentId)) {
+              return {
+                content: [{ type: "text", text: `Access denied to scope: ${scope}` }],
+                details: { error: "scope_access_denied", requestedScope: scope },
+              };
+            }
+            scopeFilter = [scope];
+          }
+
+          const results = await retrieveWithRetry(runtimeContext.retriever, {
+            query,
+            limit: safeLimit,
+            scopeFilter,
+            source: "manual",
+          });
+          if (results.length === 0) {
+            return {
+              content: [{ type: "text", text: "No relevant memories found." }],
+              details: { action: "empty", query, scopeFilter },
+            };
+          }
+
+          const lines = results.map((r, idx) => {
+            const meta = parseSmartMetadata(r.entry.metadata, r.entry);
+            const sourceBreakdown = [];
+            if (r.sources.vector) sourceBreakdown.push(`vec=${r.sources.vector.score.toFixed(3)}`);
+            if (r.sources.bm25) sourceBreakdown.push(`bm25=${r.sources.bm25.score.toFixed(3)}`);
+            if (r.sources.reranked) sourceBreakdown.push(`rerank=${r.sources.reranked.score.toFixed(3)}`);
+            return [
+              `${idx + 1}. [${r.entry.id}] score=${r.score.toFixed(3)} ${sourceBreakdown.join(" ")}`.trim(),
+              `   state=${meta.state} layer=${meta.memory_layer} source=${meta.source} tier=${meta.tier}`,
+              `   access=${meta.access_count} injected=${meta.injected_count} badRecall=${meta.bad_recall_count} suppressedUntilTurn=${meta.suppressed_until_turn}`,
+              `   text=${truncateText(normalizeInlineText(meta.l0_abstract || r.entry.text), 180)}`,
+            ].join("\n");
+          });
+
+          return {
+            content: [{ type: "text", text: lines.join("\n") }],
+            details: {
+              action: "explain_rank",
+              query,
+              count: results.length,
+              results: sanitizeMemoryForSerialization(results),
+            },
+          };
+        },
+      };
+    },
+    { name: "memory_explain_rank" },
+  );
+}
+
 // ============================================================================
 // Tool Registration Helper
 // ============================================================================
@@ -1433,6 +1922,10 @@ export function registerAllMemoryTools(
   if (options.enableManagementTools) {
     registerMemoryStatsTool(api, context);
     registerMemoryListTool(api, context);
+    registerMemoryPromoteTool(api, context);
+    registerMemoryArchiveTool(api, context);
+    registerMemoryCompactTool(api, context);
+    registerMemoryExplainRankTool(api, context);
   }
   if (options.enableSelfImprovementTools !== false) {
     registerSelfImprovementLogTool(api, context);
